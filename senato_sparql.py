@@ -116,16 +116,15 @@ def fetch_senato_last_48h(
 
     q_ddl = f"""
 PREFIX rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
-PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
 PREFIX xsd:  <http://www.w3.org/2001/XMLSchema#>
 
-SELECT ?s ?label ?numero ?data ?url
+SELECT ?s ?titolo ?numeroFase ?fase ?data
 WHERE {{
   ?s rdf:type <http://dati.senato.it/osr/Ddl> .
-  OPTIONAL {{ ?s rdfs:label ?label . }}
-  OPTIONAL {{ ?s <http://dati.senato.it/osr/numero> ?numero . }}
+  OPTIONAL {{ ?s <http://dati.senato.it/osr/titolo> ?titolo . }}
+  OPTIONAL {{ ?s <http://dati.senato.it/osr/numeroFase> ?numeroFase . }}
+  OPTIONAL {{ ?s <http://dati.senato.it/osr/fase> ?fase . }}
   OPTIONAL {{ ?s <http://dati.senato.it/osr/dataPresentazione> ?data . }}
-  OPTIONAL {{ ?s <http://dati.senato.it/osr/URLTesto> ?url . }}
 
   FILTER(BOUND(?data))
   FILTER(STR(?data) >= "{start_date}")
@@ -168,21 +167,22 @@ LIMIT {int(limit_each)}
     sind: List[Dict[str, str]] = []
 
     # DDL
-    try:
-        res = _request_with_retries(q_ddl)
-        rows = _bindings_to_rows(res.get("results", {}).get("bindings", []))
         for r in rows:
             act_uri = r.get("s", "")
-            numero = (r.get("numero", "") or "").strip()
-            label = (r.get("label", "") or "").strip() or "(senza titolo)"
-            url = (r.get("url", "") or "").strip() or act_uri
+            titolo = (r.get("titolo", "") or "").strip() or "(senza titolo)"
+            numero = (r.get("numeroFase", "") or "").strip()
+            fase = (r.get("fase", "") or "").strip()
             data_pres = (r.get("data", "") or "").strip()
+
+            # preferisci numeroFase, altrimenti usa "S.####" in fase
+            act_id = f"DDL {numero}" if numero else (fase if fase else "DDL")
+
             ddls.append(
                 {
                     "branch": "Senato",
-                    "act_id": f"DDL {numero}".strip(),
-                    "title": label,
-                    "url": url,
+                    "act_id": act_id,
+                    "title": titolo,
+                    "url": act_uri,
                     "why": "SPARQL Senato (DDL)",
                     "date": data_pres,
                 }
