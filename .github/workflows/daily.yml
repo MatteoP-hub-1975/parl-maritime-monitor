@@ -1,12 +1,20 @@
 name: daily-check
 on:
-  schedule:
-    - cron: "0 7 * * *"   # ogni giorno 07:00 UTC (poi lo cambiamo)
   workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - name: Say hello
-        run: echo "Workflow OK"
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Send test email
+        env:
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          ALERT_TO_EMAIL: ${{ secrets.ALERT_TO_EMAIL }}
+        run: python send_test_email.py
