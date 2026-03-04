@@ -1,0 +1,12 @@
+name: daily-check
+on:
+  schedule:
+    - cron: "0 7 * * *"   # ogni giorno 07:00 UTC (poi lo cambiamo)
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Say hello
+        run: echo "Workflow OK"
