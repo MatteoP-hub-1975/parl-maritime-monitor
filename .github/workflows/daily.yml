@@ -1,5 +1,7 @@
 name: daily-check
 on:
+  schedule:
+    - cron: "0 7 * * *"   # ogni giorno 07:00 UTC (poi lo cambiamo su Roma)
   workflow_dispatch:
 
 jobs:
@@ -12,7 +14,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Send test email
+      - name: Send email (current step = test)
         env:
           SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
