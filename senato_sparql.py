@@ -44,12 +44,11 @@ def _sparql_request_json(query: str, timeout_s: int = 25) -> Dict[str, Any]:
     # 2) Fallback GET (Virtuoso-style variants)
     get_variants = [
         {"query": query},
-        {"query": query, "format": "json"},
         {"query": query, "output": "json"},
-        {"query": query, "results": "json"},
-        {"query": query, "format": "application/sparql-results+json"},
-    ]
-
+        {"query": query, "output": "application/sparql-results+json"},
+        {"query": query, "output": "application/json"},
+        {"query": query, "output": "text/csv"},
+]
     last_err: Exception | None = None
     for params_dict in get_variants:
         try:
