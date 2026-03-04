@@ -17,34 +17,70 @@ def _post_sparql(
     backoff_s: int = 5,
 ) -> Dict[str, Any]:
     """
-    POST a SPARQL query and return the parsed JSON results.
+    Try POST first; if server returns 403, fallback to GET with encoded query.
     Retries with backoff; raises on final failure.
     """
-    data = urllib.parse.urlencode({"query": query}).encode("utf-8")
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    headers_common = {
         "Accept": "application/sparql-results+json",
         "User-Agent": "parl-maritime-monitor/0.1 (GitHub Actions)",
     }
 
     last_err: Exception | None = None
+
     for attempt in range(1, retries + 1):
         try:
+            # --- 1) POST ---
+            data = urllib.parse.urlencode({"query": query}).encode("utf-8")
+            headers_post = {
+                **headers_common,
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            }
             req = urllib.request.Request(
                 SENATO_SPARQL_ENDPOINT,
                 data=data,
-                headers=headers,
+                headers=headers_post,
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=timeout_s) as resp:
                 payload = resp.read().decode("utf-8")
                 return json.loads(payload)
+
+        except urllib.error.HTTPError as e:
+            last_err = e
+
+            # If forbidden, try GET (many SPARQL endpoints prefer/allow GET)
+            if e.code == 403:
+                try:
+                    params = urllib.parse.urlencode({
+                        "query": query,
+                        # alcuni endpoint rispettano "format"
+                        "format": "application/sparql-results+json",
+                    })
+                    url = f"{SENATO_SPARQL_ENDPOINT}?{params}"
+                    req = urllib.request.Request(
+                        url,
+                        headers=headers_common,
+                        method="GET",
+                    )
+                    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                        payload = resp.read().decode("utf-8")
+                        return json.loads(payload)
+                except Exception as e2:
+                    last_err = e2
+
+            if attempt < retries:
+                time.sleep(backoff_s * attempt)
+            else:
+                raise last_err
+
         except Exception as e:
             last_err = e
             if attempt < retries:
                 time.sleep(backoff_s * attempt)
             else:
                 raise last_err
+
+    raise last_err  # type: ignore
 
 
 def _bindings_to_rows(bindings: List[Dict[str, Any]]) -> List[Dict[str, str]]:
