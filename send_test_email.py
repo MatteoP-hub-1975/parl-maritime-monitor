@@ -7,6 +7,9 @@ from email.message import EmailMessage
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from senato_sparql import fetch_senato_last_48h
+
+
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
 
@@ -48,6 +51,9 @@ def render_section(title: str, items: list, empty_line: str) -> str:
 
     for it in items:
         line = f"- {it.get('branch','?')} | {it.get('act_id', it.get('act_ref','?'))} | {it.get('title','(senza titolo)')}"
+        # se presente, mostra data presentazione (non è la deadline)
+        if it.get("date"):
+            line += f" | data: {it['date']}"
         if it.get("deadline_dt"):
             line += f" | scadenza: {it['deadline_dt']}"
         if it.get("why"):
@@ -67,10 +73,18 @@ def main() -> None:
 
     now_rome = datetime.now(ZoneInfo("Europe/Rome")).strftime("%Y-%m-%d %H:%M")
 
-    # --- Step corrente: check reachability sorgenti (no query complesse ancora) ---
-    check_url("https://dati.senato.it/sparql")
+    # --- Step corrente: check + prima estrazione reale Senato (DDL + Sindacato Ispettivo, ultime 48h) ---
+    senato_up = check_url("https://dati.senato.it/sparql")
 
-    # --- Placeholder: qui in futuro metteremo i risultati veri ---
+    senato_ddls = []
+    senato_sind = []
+    if senato_up:
+        ddls, sind, warn = fetch_senato_last_48h(limit_each=10, days=2)
+        senato_ddls = ddls
+        senato_sind = sind
+        SOURCES_WARNINGS.extend(warn)
+
+    # --- Placeholder: qui in futuro metteremo i risultati "marittimi" veri ---
     relevant_items = []   # list of dict: {branch, act_id, title, url, why}
     deadlines = []        # list of dict: {branch, act_ref, deadline_dt, url, evidence}
     borderline_items = [] # list of dict
@@ -82,6 +96,20 @@ def main() -> None:
         "Sorgenti / Warning",
         "------------------",
         "\n".join([f"- {w}" for w in SOURCES_WARNINGS]) if SOURCES_WARNINGS else "- Nessun problema rilevato sulle sorgenti.",
+        "",
+        "Senato — Ultime 48h (DDL + Sindacato Ispettivo)",
+        "---------------------------------------------",
+        render_section(
+            "DDL (ultimi 10)",
+            senato_ddls,
+            "Nessun DDL trovato nelle ultime 48h (o sorgente non disponibile)."
+        ),
+        "",
+        render_section(
+            "Sindacato Ispettivo (ultimi 10, P1)",
+            senato_sind,
+            "Nessun atto di sindacato ispettivo trovato nelle ultime 48h (o sorgente non disponibile)."
+        ),
         "",
         render_section(
             "1) Atti rilevanti (marittimo)",
