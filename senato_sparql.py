@@ -128,8 +128,7 @@ WHERE {{
   OPTIONAL {{ ?s <http://dati.senato.it/osr/URLTesto> ?url . }}
 
   FILTER(BOUND(?data))
-  BIND(xsd:date(?data) AS ?d)
-  FILTER(?d >= "{start_date}"^^xsd:date)
+  FILTER(STR(?data) >= "{start_date}")
 }}
 ORDER BY DESC(?data)
 LIMIT {int(limit_each)}
@@ -150,8 +149,7 @@ WHERE {{
   OPTIONAL {{ ?s <http://dati.senato.it/osr/tipo> ?tipo . }}
 
   FILTER(BOUND(?data))
-  BIND(xsd:date(?data) AS ?d)
-  FILTER(?d >= "{start_date}"^^xsd:date)
+  FILTER(STR(?data) >= "{start_date}")
 
   FILTER(
     ?tipo = "Interrogazione con richiesta di risposta scritta"^^xsd:string ||
