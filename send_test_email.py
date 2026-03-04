@@ -2,13 +2,11 @@ import os
 import smtplib
 import time
 import urllib.request
-import urllib.error
 from email.message import EmailMessage
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from senato_sparql import fetch_senato_last_48h
-
 
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
@@ -17,10 +15,6 @@ SOURCES_WARNINGS: list[str] = []
 
 
 def check_url(url: str, timeout_s: int = 15, retries: int = 3, backoff_s: int = 5) -> bool:
-    """
-    Simple reachability check with retries/backoff.
-    If it fails, it appends a warning to SOURCES_WARNINGS and returns False.
-    """
     last_err = None
     for attempt in range(1, retries + 1):
         try:
@@ -43,26 +37,107 @@ def check_url(url: str, timeout_s: int = 15, retries: int = 3, backoff_s: int = 
     return False
 
 
-def render_section(title: str, items: list, empty_line: str) -> str:
-    lines = [f"{title}", "-" * len(title)]
+def render_senato_ddls(items: list[dict]) -> str:
+    title = "DDL Senato (ultimi 10)"
+    lines = [title, "-" * len(title)]
     if not items:
-        lines.append(empty_line)
+        lines.append("Nessun DDL trovato nelle ultime 48h (o sorgente non disponibile).")
         return "\n".join(lines)
 
     for it in items:
-        line = f"- {it.get('branch','?')} | {it.get('act_id', it.get('act_ref','?'))} | {it.get('title','(senza titolo)')}"
-        # se presente, mostra data presentazione (non è la deadline)
-        if it.get("date"):
-            line += f" | data: {it['date']}"
-        if it.get("deadline_dt"):
-            line += f" | scadenza: {it['deadline_dt']}"
-        if it.get("why"):
-            line += f" | perché: {it['why']}"
-        if it.get("url"):
-            line += f" | {it['url']}"
-        lines.append(line)
-        if it.get("evidence"):
-            lines.append(f"  evidenza: {it['evidence']}")
+        # Campi richiesti: ramo, n.ddl, titolo, data presentazione, iniziativa, stato, commissione, link
+        ramo = it.get("branch", "Senato")
+        n = (it.get("ddl_number") or "").strip()
+        ddl = f"DDL {n}".strip() if n else "DDL"
+        titolo = it.get("title", "(senza titolo)").strip()
+
+        chunks = [f"- {ramo} | {ddl} | {titolo}"]
+
+        dp = (it.get("date_presentazione") or "").strip()
+        if dp:
+            chunks.append(f"data presentazione: {dp}")
+
+        iniziativa = (it.get("iniziativa") or "").strip()
+        if iniziativa:
+            chunks.append(f"iniziativa: {iniziativa}")
+
+        stato = (it.get("stato") or "").strip()
+        if stato:
+            chunks.append(f"stato: {stato}")
+
+        comm = (it.get("commissione") or "").strip()
+        if comm:
+            chunks.append(f"commissione: {comm}")
+
+        url = (it.get("url") or "").strip()
+        if url:
+            chunks.append(url)
+
+        lines.append(" | ".join(chunks))
+
+    return "\n".join(lines)
+
+
+def render_senato_sindisp(items: list[dict]) -> str:
+    title = "Sindacato ispettivo Senato (ultimi 10, P1)"
+    lines = [title, "-" * len(title)]
+    if not items:
+        lines.append("Nessun atto di sindacato ispettivo trovato nelle ultime 48h (o sorgente non disponibile).")
+        return "\n".join(lines)
+
+    for it in items:
+        ramo = it.get("branch", "Senato")
+        tipo = (it.get("tipo") or "").strip() or "Sindacato ispettivo"
+        numero = (it.get("numero") or "").strip()
+
+        chunks = [f"- {ramo} | {tipo}"]
+
+        # titolo (se presente)
+        tit = (it.get("titolo") or "").strip()
+        if tit:
+            chunks.append(tit)
+
+        # a chi è rivolta (se presente)
+        dest = (it.get("destinatario") or "").strip()
+        if dest:
+            chunks.append(f"a: {dest}")
+
+        # numero (sempre, se disponibile)
+        if numero:
+            chunks.append(f"n.: {numero}")
+
+        # proponente
+        prop = (it.get("proponente") or "").strip()
+        if prop:
+            chunks.append(f"proponente: {prop}")
+
+        # gruppo
+        gruppo = (it.get("gruppo") or "").strip()
+        if gruppo:
+            chunks.append(f"gruppo: {gruppo}")
+
+        # stato
+        stato = (it.get("stato") or "").strip()
+        if stato:
+            chunks.append(f"stato: {stato}")
+
+        # link show-doc
+        url = (it.get("url") or "").strip()
+        if url:
+            chunks.append(url)
+
+        lines.append(" | ".join(chunks))
+
+    return "\n".join(lines)
+
+
+def render_simple_section(title: str, items: list, empty_line: str) -> str:
+    lines = [title, "-" * len(title)]
+    if not items:
+        lines.append(empty_line)
+        return "\n".join(lines)
+    for it in items:
+        lines.append(f"- {it}")
     return "\n".join(lines)
 
 
@@ -73,7 +148,6 @@ def main() -> None:
 
     now_rome = datetime.now(ZoneInfo("Europe/Rome")).strftime("%Y-%m-%d %H:%M")
 
-      # --- Step corrente: check + prima estrazione reale Senato (DDL + Sindacato Ispettivo, ultime 48h) ---
     senato_up = check_url("https://dati.senato.it/sparql")
 
     senato_ddls = []
@@ -89,10 +163,10 @@ def main() -> None:
                 f"Errore imprevisto durante fetch_senato_last_48h: {type(e).__name__}: {e}"
             )
 
-    # --- Placeholder: qui in futuro metteremo i risultati "marittimi" veri ---
-    relevant_items = []   # list of dict: {branch, act_id, title, url, why}
-    deadlines = []        # list of dict: {branch, act_ref, deadline_dt, url, evidence}
-    borderline_items = [] # list of dict
+    # Placeholder (marittimo + scadenze) — li riempiamo dopo
+    relevant_items = []
+    deadlines = []
+    borderline_items = []
 
     body = "\n\n".join([
         "Monitor Parlamento — Trasporto marittimo",
@@ -102,35 +176,23 @@ def main() -> None:
         "------------------",
         "\n".join([f"- {w}" for w in SOURCES_WARNINGS]) if SOURCES_WARNINGS else "- Nessun problema rilevato sulle sorgenti.",
         "",
-        "Senato — Ultime 48h (DDL + Sindacato Ispettivo)",
-        "---------------------------------------------",
-        render_section(
-            "DDL (ultimi 10)",
-            senato_ddls,
-            "Nessun DDL trovato nelle ultime 48h (o sorgente non disponibile)."
-        ),
+        "Senato — Ultime 48h",
+        "------------------",
+        render_senato_ddls(senato_ddls),
         "",
-        render_section(
-            "Sindacato Ispettivo (ultimi 10, P1)",
-            senato_sind,
-            "Nessun atto di sindacato ispettivo trovato nelle ultime 48h (o sorgente non disponibile)."
-        ),
+        render_senato_sindisp(senato_sind),
         "",
-        render_section(
-            "1) Atti rilevanti (marittimo)",
-            relevant_items,
-            "Nessun atto rilevante trovato (placeholder)."
-        ),
-        render_section(
-            "2) Scadenze emendamenti (nuove o cambiate)",
-            deadlines,
-            "Nessuna scadenza trovata (placeholder)."
-        ),
-        render_section(
-            "3) Borderline (da rivedere)",
-            borderline_items,
-            "Nessun caso borderline (placeholder)."
-        ),
+        "1) Atti rilevanti (marittimo)",
+        "-----------------------------",
+        "Nessun atto rilevante trovato (placeholder).",
+        "",
+        "2) Scadenze emendamenti (nuove o cambiate)",
+        "------------------------------------------",
+        "Nessuna scadenza trovata (placeholder).",
+        "",
+        "3) Borderline (da rivedere)",
+        "---------------------------",
+        "Nessun caso borderline (placeholder).",
     ])
 
     msg = EmailMessage()
