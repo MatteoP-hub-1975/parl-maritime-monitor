@@ -73,21 +73,21 @@ def main() -> None:
 
     now_rome = datetime.now(ZoneInfo("Europe/Rome")).strftime("%Y-%m-%d %H:%M")
 
-    # --- Step corrente: check + prima estrazione reale Senato (DDL + Sindacato Ispettivo, ultime 48h) ---
+      # --- Step corrente: check + prima estrazione reale Senato (DDL + Sindacato Ispettivo, ultime 48h) ---
     senato_up = check_url("https://dati.senato.it/sparql")
 
     senato_ddls = []
     senato_sind = []
-   if senato_up:
-    try:
-        ddls, sind, warn = fetch_senato_last_48h(limit_each=10, days=2)
-        senato_ddls = ddls
-        senato_sind = sind
-        SOURCES_WARNINGS.extend(warn)
-    except Exception as e:
-        SOURCES_WARNINGS.append(
-            f"Errore imprevisto durante fetch_senato_last_48h: {type(e).__name__}: {e}"
-        )
+    if senato_up:
+        try:
+            ddls, sind, warn = fetch_senato_last_48h(limit_each=10, days=2)
+            senato_ddls = ddls
+            senato_sind = sind
+            SOURCES_WARNINGS.extend(warn)
+        except Exception as e:
+            SOURCES_WARNINGS.append(
+                f"Errore imprevisto durante fetch_senato_last_48h: {type(e).__name__}: {e}"
+            )
 
     # --- Placeholder: qui in futuro metteremo i risultati "marittimi" veri ---
     relevant_items = []   # list of dict: {branch, act_id, title, url, why}
