@@ -78,11 +78,16 @@ def main() -> None:
 
     senato_ddls = []
     senato_sind = []
-    if senato_up:
+   if senato_up:
+    try:
         ddls, sind, warn = fetch_senato_last_48h(limit_each=10, days=2)
         senato_ddls = ddls
         senato_sind = sind
         SOURCES_WARNINGS.extend(warn)
+    except Exception as e:
+        SOURCES_WARNINGS.append(
+            f"Errore imprevisto durante fetch_senato_last_48h: {type(e).__name__}: {e}"
+        )
 
     # --- Placeholder: qui in futuro metteremo i risultati "marittimi" veri ---
     relevant_items = []   # list of dict: {branch, act_id, title, url, why}
