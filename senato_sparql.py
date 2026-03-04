@@ -48,7 +48,8 @@ def _sparql_request_json(query: str, timeout_s: int = 25) -> Dict[str, Any]:
         {"query": query, "output": "application/sparql-results+json"},
         {"query": query, "output": "application/json"},
         {"query": query, "output": "text/csv"},
-]
+    ]
+
     last_err: Exception | None = None
     for params_dict in get_variants:
         try:
@@ -58,20 +59,23 @@ def _sparql_request_json(query: str, timeout_s: int = 25) -> Dict[str, Any]:
             with urllib.request.urlopen(req, timeout=timeout_s) as resp:
                 payload = resp.read().decode("utf-8")
                 return json.loads(payload)
+
         except urllib.error.HTTPError as he:
             # prova a leggere il body dell’errore (spesso contiene il motivo del 400)
             try:
                 err_body = he.read().decode("utf-8", errors="replace")
-                err_body = err_body.strip().replace("\n", " ")[:500]  # max 500 char
+                err_body = err_body.strip().replace("\n", " ")[:500]
             except Exception:
                 err_body = "(impossibile leggere body)"
-            last_err = RuntimeError(f"HTTP {he.code} su GET variant {params_dict}. Body: {err_body}")
+            last_err = RuntimeError(
+                f"HTTP {he.code} su GET variant {params_dict}. Body: {err_body}"
+            )
             continue
+
         except Exception as e2:
             last_err = e2
             continue
 
-    # If all GET variants fail, raise the last error
     raise last_err if last_err else RuntimeError("SPARQL GET fallback failed without exception")
 
 
@@ -112,11 +116,11 @@ def fetch_senato_last_48h(
     Returns (ddls, sindacato_ispettivo, warnings)
     """
     warnings: List[str] = []
-    start_date = (date.today() - timedelta(days=days)).isoformat()  # YYYY-MM-DD
+    start_date = (date.today() - timedelta(days=days)).isoformat()
 
+    # ✅ DDL: usa titolo/numeroFase/fase
     q_ddl = f"""
 PREFIX rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
-PREFIX xsd:  <http://www.w3.org/2001/XMLSchema#>
 
 SELECT ?s ?titolo ?numeroFase ?fase ?data
 WHERE {{
@@ -133,6 +137,7 @@ ORDER BY DESC(?data)
 LIMIT {int(limit_each)}
 """.strip()
 
+    # Sindacato ispettivo (come prima)
     q_sind = f"""
 PREFIX rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
@@ -166,7 +171,10 @@ LIMIT {int(limit_each)}
     ddls: List[Dict[str, str]] = []
     sind: List[Dict[str, str]] = []
 
-    # DDL
+    # --- DDL ---
+    try:
+        res = _request_with_retries(q_ddl)
+        rows = _bindings_to_rows(res.get("results", {}).get("bindings", []))
         for r in rows:
             act_uri = r.get("s", "")
             titolo = (r.get("titolo", "") or "").strip() or "(senza titolo)"
@@ -174,7 +182,6 @@ LIMIT {int(limit_each)}
             fase = (r.get("fase", "") or "").strip()
             data_pres = (r.get("data", "") or "").strip()
 
-            # preferisci numeroFase, altrimenti usa "S.####" in fase
             act_id = f"DDL {numero}" if numero else (fase if fase else "DDL")
 
             ddls.append(
@@ -190,7 +197,7 @@ LIMIT {int(limit_each)}
     except Exception as e:
         warnings.append(f"Query DDL fallita su SPARQL Senato: {type(e).__name__}: {e}")
 
-    # Sindacato ispettivo
+    # --- Sindacato ispettivo ---
     try:
         res = _request_with_retries(q_sind)
         rows = _bindings_to_rows(res.get("results", {}).get("bindings", []))
@@ -201,6 +208,7 @@ LIMIT {int(limit_each)}
             url = (r.get("url", "") or "").strip() or act_uri
             data_pres = (r.get("data", "") or "").strip()
             tipo = (r.get("tipo", "") or "").strip() or "Sindacato ispettivo"
+
             sind.append(
                 {
                     "branch": "Senato",
