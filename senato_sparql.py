@@ -58,6 +58,15 @@ def _sparql_request_json(query: str, timeout_s: int = 25) -> Dict[str, Any]:
             with urllib.request.urlopen(req, timeout=timeout_s) as resp:
                 payload = resp.read().decode("utf-8")
                 return json.loads(payload)
+        except urllib.error.HTTPError as he:
+            # prova a leggere il body dell’errore (spesso contiene il motivo del 400)
+            try:
+                err_body = he.read().decode("utf-8", errors="replace")
+                err_body = err_body.strip().replace("\n", " ")[:500]  # max 500 char
+            except Exception:
+                err_body = "(impossibile leggere body)"
+            last_err = RuntimeError(f"HTTP {he.code} su GET variant {params_dict}. Body: {err_body}")
+            continue
         except Exception as e2:
             last_err = e2
             continue
