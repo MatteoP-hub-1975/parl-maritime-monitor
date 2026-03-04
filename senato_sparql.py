@@ -49,24 +49,36 @@ def _post_sparql(
             last_err = e
 
             # If forbidden, try GET (many SPARQL endpoints prefer/allow GET)
-            if e.code == 403:
-                try:
-                    params = urllib.parse.urlencode({
-                        "query": query,
-                        # alcuni endpoint rispettano "format"
-                        "format": "application/sparql-results+json",
-                    })
-                    url = f"{SENATO_SPARQL_ENDPOINT}?{params}"
-                    req = urllib.request.Request(
-                        url,
-                        headers=headers_common,
-                        method="GET",
-                    )
-                    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-                        payload = resp.read().decode("utf-8")
-                        return json.loads(payload)
-                except Exception as e2:
-                    last_err = e2
+                        if e.code == 403:
+                # Fallback GET: prova più varianti di parametri (Virtuoso-style)
+                get_variants = [
+                    # 1) solo query + Accept header
+                    {"query": query},
+                    # 2) Virtuoso spesso accetta format=json
+                    {"query": query, "format": "json"},
+                    # 3) alcune installazioni usano output=json
+                    {"query": query, "output": "json"},
+                    # 4) altre usano results=json
+                    {"query": query, "results": "json"},
+                    # 5) oppure format=application/sparql-results+json (la proviamo comunque per ultima)
+                    {"query": query, "format": "application/sparql-results+json"},
+                ]
+
+                for params_dict in get_variants:
+                    try:
+                        params = urllib.parse.urlencode(params_dict)
+                        url = f"{SENATO_SPARQL_ENDPOINT}?{params}"
+                        req = urllib.request.Request(
+                            url,
+                            headers=headers_common,
+                            method="GET",
+                        )
+                        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                            payload = resp.read().decode("utf-8")
+                            return json.loads(payload)
+                    except Exception as e2:
+                        last_err = e2
+                        continue
 
             if attempt < retries:
                 time.sleep(backoff_s * attempt)
