@@ -6,104 +6,91 @@ import urllib.error
 from datetime import date, timedelta
 from typing import Any, Dict, List, Tuple
 
-
 SENATO_SPARQL_ENDPOINT = "https://dati.senato.it/sparql"
 
 
-def _post_sparql(
-    query: str,
-    timeout_s: int = 25,
-    retries: int = 3,
-    backoff_s: int = 5,
-) -> Dict[str, Any]:
+def _sparql_request_json(query: str, timeout_s: int = 25) -> Dict[str, Any]:
     """
-    Try POST first; if server returns 403, fallback to GET with encoded query.
-    Retries with backoff; raises on final failure.
+    Try SPARQL POST; if 403 then try GET with multiple Virtuoso-style variants.
+    Return parsed JSON.
     """
     headers_common = {
         "Accept": "application/sparql-results+json",
         "User-Agent": "parl-maritime-monitor/0.1 (GitHub Actions)",
     }
 
-    last_err: Exception | None = None
+    # 1) Try POST
+    try:
+        data = urllib.parse.urlencode({"query": query}).encode("utf-8")
+        headers_post = {
+            **headers_common,
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        }
+        req = urllib.request.Request(
+            SENATO_SPARQL_ENDPOINT,
+            data=data,
+            headers=headers_post,
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            payload = resp.read().decode("utf-8")
+            return json.loads(payload)
 
-    for attempt in range(1, retries + 1):
+    except urllib.error.HTTPError as e:
+        # Only fallback on forbidden
+        if e.code != 403:
+            raise
+
+    # 2) Fallback GET (Virtuoso-style variants)
+    get_variants = [
+        {"query": query},
+        {"query": query, "format": "json"},
+        {"query": query, "output": "json"},
+        {"query": query, "results": "json"},
+        {"query": query, "format": "application/sparql-results+json"},
+    ]
+
+    last_err: Exception | None = None
+    for params_dict in get_variants:
         try:
-            # --- 1) POST ---
-            data = urllib.parse.urlencode({"query": query}).encode("utf-8")
-            headers_post = {
-                **headers_common,
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            }
-            req = urllib.request.Request(
-                SENATO_SPARQL_ENDPOINT,
-                data=data,
-                headers=headers_post,
-                method="POST",
-            )
+            params = urllib.parse.urlencode(params_dict)
+            url = f"{SENATO_SPARQL_ENDPOINT}?{params}"
+            req = urllib.request.Request(url, headers=headers_common, method="GET")
             with urllib.request.urlopen(req, timeout=timeout_s) as resp:
                 payload = resp.read().decode("utf-8")
                 return json.loads(payload)
+        except Exception as e2:
+            last_err = e2
+            continue
 
-        except urllib.error.HTTPError as e:
-            last_err = e
+    # If all GET variants fail, raise the last error
+    raise last_err if last_err else RuntimeError("SPARQL GET fallback failed without exception")
 
-            # If forbidden, try GET (many SPARQL endpoints prefer/allow GET)
-                        if e.code == 403:
-                # Fallback GET: prova più varianti di parametri (Virtuoso-style)
-                get_variants = [
-                    # 1) solo query + Accept header
-                    {"query": query},
-                    # 2) Virtuoso spesso accetta format=json
-                    {"query": query, "format": "json"},
-                    # 3) alcune installazioni usano output=json
-                    {"query": query, "output": "json"},
-                    # 4) altre usano results=json
-                    {"query": query, "results": "json"},
-                    # 5) oppure format=application/sparql-results+json (la proviamo comunque per ultima)
-                    {"query": query, "format": "application/sparql-results+json"},
-                ]
 
-                for params_dict in get_variants:
-                    try:
-                        params = urllib.parse.urlencode(params_dict)
-                        url = f"{SENATO_SPARQL_ENDPOINT}?{params}"
-                        req = urllib.request.Request(
-                            url,
-                            headers=headers_common,
-                            method="GET",
-                        )
-                        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-                            payload = resp.read().decode("utf-8")
-                            return json.loads(payload)
-                    except Exception as e2:
-                        last_err = e2
-                        continue
-
-            if attempt < retries:
-                time.sleep(backoff_s * attempt)
-            else:
-                raise last_err
-
+def _request_with_retries(
+    query: str,
+    timeout_s: int = 25,
+    retries: int = 3,
+    backoff_s: int = 5,
+) -> Dict[str, Any]:
+    last_err: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            return _sparql_request_json(query=query, timeout_s=timeout_s)
         except Exception as e:
             last_err = e
             if attempt < retries:
                 time.sleep(backoff_s * attempt)
             else:
-                raise last_err
-
-    raise last_err  # type: ignore
+                raise
+    raise last_err if last_err else RuntimeError("SPARQL failed without exception")
 
 
 def _bindings_to_rows(bindings: List[Dict[str, Any]]) -> List[Dict[str, str]]:
-    """
-    Convert SPARQL JSON bindings to simple dict[str,str].
-    """
     rows: List[Dict[str, str]] = []
     for b in bindings:
         row: Dict[str, str] = {}
         for k, v in b.items():
-            # v like {"type":"literal","value":"..."} or {"type":"uri","value":"..."}
             row[k] = v.get("value", "")
         rows.append(row)
     return rows
@@ -115,15 +102,10 @@ def fetch_senato_last_48h(
 ) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], List[str]]:
     """
     Returns (ddls, sindacato_ispettivo, warnings)
-
-    ddls rows keys: branch, act_id, title, url, why, date
-    sindacato rows keys: branch, act_id, title, url, why, date
     """
     warnings: List[str] = []
-
     start_date = (date.today() - timedelta(days=days)).isoformat()  # YYYY-MM-DD
 
-    # --- Query 1: DDL ---
     q_ddl = f"""
 PREFIX rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
@@ -145,7 +127,6 @@ ORDER BY DESC(?data)
 LIMIT {int(limit_each)}
 """.strip()
 
-    # --- Query 2: Sindacato ispettivo (P1: tutti i tipi) ---
     q_sind = f"""
 PREFIX rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
@@ -164,7 +145,6 @@ WHERE {{
   BIND(xsd:date(?data) AS ?d)
   FILTER(?d >= "{start_date}"^^xsd:date)
 
-  # P1: includi tutti i tipi che hai trovato
   FILTER(
     ?tipo = "Interrogazione con richiesta di risposta scritta"^^xsd:string ||
     ?tipo = "Interrogazione"^^xsd:string ||
@@ -181,45 +161,50 @@ LIMIT {int(limit_each)}
     ddls: List[Dict[str, str]] = []
     sind: List[Dict[str, str]] = []
 
-    # Run queries with graceful degradation (R1)
+    # DDL
     try:
-        res = _post_sparql(q_ddl)
+        res = _request_with_retries(q_ddl)
         rows = _bindings_to_rows(res.get("results", {}).get("bindings", []))
         for r in rows:
             act_uri = r.get("s", "")
-            numero = r.get("numero", "").strip()
-            label = r.get("label", "").strip() or "(senza titolo)"
-            url = r.get("url", "").strip() or act_uri
-            data_pres = r.get("data", "").strip()
-            ddls.append({
-                "branch": "Senato",
-                "act_id": f"DDL {numero}".strip(),
-                "title": label,
-                "url": url,
-                "why": "SPARQL Senato (DDL)",
-                "date": data_pres,
-            })
+            numero = (r.get("numero", "") or "").strip()
+            label = (r.get("label", "") or "").strip() or "(senza titolo)"
+            url = (r.get("url", "") or "").strip() or act_uri
+            data_pres = (r.get("data", "") or "").strip()
+            ddls.append(
+                {
+                    "branch": "Senato",
+                    "act_id": f"DDL {numero}".strip(),
+                    "title": label,
+                    "url": url,
+                    "why": "SPARQL Senato (DDL)",
+                    "date": data_pres,
+                }
+            )
     except Exception as e:
         warnings.append(f"Query DDL fallita su SPARQL Senato: {type(e).__name__}: {e}")
 
+    # Sindacato ispettivo
     try:
-        res = _post_sparql(q_sind)
+        res = _request_with_retries(q_sind)
         rows = _bindings_to_rows(res.get("results", {}).get("bindings", []))
         for r in rows:
             act_uri = r.get("s", "")
-            numero = r.get("numero", "").strip()
-            label = r.get("label", "").strip() or "(senza titolo)"
-            url = r.get("url", "").strip() or act_uri
-            data_pres = r.get("data", "").strip()
-            tipo = r.get("tipo", "").strip() or "Sindacato ispettivo"
-            sind.append({
-                "branch": "Senato",
-                "act_id": f"{tipo} {numero}".strip(),
-                "title": label,
-                "url": url,
-                "why": "SPARQL Senato (Sindacato ispettivo)",
-                "date": data_pres,
-            })
+            numero = (r.get("numero", "") or "").strip()
+            label = (r.get("label", "") or "").strip() or "(senza titolo)"
+            url = (r.get("url", "") or "").strip() or act_uri
+            data_pres = (r.get("data", "") or "").strip()
+            tipo = (r.get("tipo", "") or "").strip() or "Sindacato ispettivo"
+            sind.append(
+                {
+                    "branch": "Senato",
+                    "act_id": f"{tipo} {numero}".strip(),
+                    "title": label,
+                    "url": url,
+                    "why": "SPARQL Senato (Sindacato ispettivo)",
+                    "date": data_pres,
+                }
+            )
     except Exception as e:
         warnings.append(f"Query Sindacato Ispettivo fallita su SPARQL Senato: {type(e).__name__}: {e}")
 
