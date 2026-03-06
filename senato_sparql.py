@@ -48,6 +48,45 @@ def _strip_html_to_text(html: str) -> str:
     return text.strip()
 
 
+def _url_looks_ok(url: str, timeout_s: int = 12) -> bool:
+    """
+    True se la pagina sembra valida (no 403/404 e no pagina errore).
+    Legge solo i primi byte per essere leggero.
+    """
+    if not url:
+        return False
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "it-IT,it;q=0.9,en;q=0.8",
+        "Connection": "close",
+        "Range": "bytes=0-2048",
+    }
+
+    try:
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            chunk = resp.read(2048).decode("utf-8", errors="replace").lower()
+    except urllib.error.HTTPError:
+        return False
+    except Exception:
+        return False
+
+    bad_markers = [
+        "errore_403",
+        "accesso negato",
+        "pagina non trovata",
+        "http 403",
+        "404",
+    ]
+    return not any(b in chunk for b in bad_markers)
+
+
 # -------------------------
 # SPARQL helpers
 # -------------------------
@@ -68,7 +107,7 @@ def _sparql_request_json(query: str, timeout_s: int = 25) -> Dict[str, Any]:
         "Connection": "close",
     }
 
-    # 1) GET
+    # 1) GET (preferito)
     try:
         params = urllib.parse.urlencode(
             {"query": query, "format": "application/sparql-results+json"}
@@ -79,6 +118,7 @@ def _sparql_request_json(query: str, timeout_s: int = 25) -> Dict[str, Any]:
             payload = resp.read().decode("utf-8", errors="replace")
             return json.loads(payload)
     except urllib.error.HTTPError as he:
+        # fallback a POST solo su errori comuni
         if he.code not in (400, 403):
             raise
 
@@ -133,17 +173,22 @@ def _bindings_to_rows(bindings: List[Dict[str, Any]]) -> List[Dict[str, str]]:
 # Utility: link Sindisp robusto
 # -------------------------
 
-def _extract_sindisp_doc_id(uri_or_url: str) -> str:
-    if not uri_or_url:
+def _extract_sindisp_doc_id(url: str) -> str:
+    """
+    Estrae l'id SOLO se presente come parametro id=... nella querystring.
+    (Evitiamo i falsi positivi e gli id "fantasma".)
+    """
+    if not url:
         return ""
     try:
-        parsed = urllib.parse.urlparse(uri_or_url)
+        parsed = urllib.parse.urlparse(url)
         qs = urllib.parse.parse_qs(parsed.query)
         if "id" in qs and qs["id"]:
             return (qs["id"][0] or "").strip()
     except Exception:
         pass
-    m = re.search(r"(\d{6,})", uri_or_url)
+
+    m = re.search(r"[?&]id=(\d+)", url)
     return m.group(1) if m else ""
 
 
@@ -211,7 +256,7 @@ ORDER BY DESC(?data)
 LIMIT {int(limit_each)}
 """.strip()
 
-    # ---- Sindacato Ispettivo (include "a risposta orale/scritta") ----
+    # ---- Sindacato Ispettivo ----
     q_sind = f"""
 PREFIX rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 
@@ -243,7 +288,7 @@ LIMIT 500
     ddls: List[Dict[str, str]] = []
     sind: List[Dict[str, str]] = []
 
-    # DDL fetch
+    # ---- DDL fetch ----
     try:
         res = _request_with_retries(q_ddl)
         rows = _bindings_to_rows(res.get("results", {}).get("bindings", []))
@@ -280,10 +325,23 @@ LIMIT 500
     except Exception as e:
         warnings.append(f"Query DDL fallita su SPARQL Senato: {type(e).__name__}: {e}")
 
-    # Sindacato fetch
+    # ---- Sindacato fetch (dedup + show-doc solo se valido) ----
     try:
         res = _request_with_retries(q_sind)
         rows = _bindings_to_rows(res.get("results", {}).get("bindings", []))
+
+        # dedup per (leg, numero) -> così eliminiamo duplicati anche se cambia "tipo"
+        sind_map: Dict[Tuple[str, str], Dict[str, str]] = {}
+        showdoc_ok_cache: Dict[str, bool] = {}
+
+        def _score_url(u: str) -> int:
+            if not u:
+                return 0
+            if "show-doc" in u:
+                return 3
+            if "loc/link.asp" in u:
+                return 2
+            return 1
 
         for r in rows:
             act_uri = (r.get("s", "") or "").strip()
@@ -294,28 +352,55 @@ LIMIT 500
             leg = (r.get("leg", "") or "19").strip()
             urltesto = (r.get("url", "") or "").strip()
 
-            doc_id = _extract_sindisp_doc_id(urltesto) or _extract_sindisp_doc_id(act_uri)
-            url_direct = _build_sindisp_showdoc_url(doc_id, leg) or urltesto or act_uri
+            # doc_id SOLO da URLTesto (non da act_uri)
+            doc_id = _extract_sindisp_doc_id(urltesto)
+            url_showdoc = _build_sindisp_showdoc_url(doc_id, leg) if doc_id else ""
 
-            sind.append(
-                {
-                    "branch": "Senato",
-                    "tipo": tipo,
-                    "numero": numero,
-                    "title": "",
-                    "url": url_direct,
-                    "date_presentazione": data_pres,
-                    "destinatario": "",
-                    "proponenti": "",
-                    "gruppo": "",
-                    "stato": esito,
-                }
-            )
+            url_direct = ""
+            if url_showdoc:
+                ok = showdoc_ok_cache.get(url_showdoc)
+                if ok is None:
+                    ok = _url_looks_ok(url_showdoc)
+                    showdoc_ok_cache[url_showdoc] = ok
+                if ok:
+                    url_direct = url_showdoc
 
-        # NB: qui NON tagliamo a limit_each: la query già limita a 500
-        # Se vuoi, puoi tagliare dopo nel send_test_email.py
+            # fallback: se show-doc non ok -> URLTesto -> act_uri
+            if not url_direct:
+                url_direct = urltesto or act_uri
+
+            item = {
+                "branch": "Senato",
+                "tipo": tipo,
+                "numero": numero,
+                "title": "",
+                "url": url_direct,
+                "date_presentazione": data_pres,
+                "destinatario": "",
+                "proponenti": "",
+                "gruppo": "",
+                "stato": esito,
+            }
+
+            key = (leg, numero)
+            prev = sind_map.get(key)
+
+            if prev is None:
+                sind_map[key] = item
+            else:
+                # preferisci link migliore
+                if _score_url(item["url"]) > _score_url(prev["url"]):
+                    sind_map[key] = item
+                elif _score_url(item["url"]) == _score_url(prev["url"]):
+                    # a parità di link, preferisci tipo più specifico (stringa più lunga)
+                    if len(item.get("tipo", "")) > len(prev.get("tipo", "")):
+                        sind_map[key] = item
+
+        sind = list(sind_map.values())
+        sind.sort(key=lambda x: (x.get("date_presentazione") or ""), reverse=True)
 
     except Exception as e:
         warnings.append(f"Query Sindacato Ispettivo fallita su SPARQL Senato: {type(e).__name__}: {e}")
+        sind = []
 
     return ddls, sind, warnings
