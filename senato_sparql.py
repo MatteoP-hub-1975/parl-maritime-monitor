@@ -1,80 +1,83 @@
-from __future__ import annotations
-
 import json
 import re
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import date, timedelta
+import urllib.error
+from datetime import date, datetime, timedelta
 from html.parser import HTMLParser
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple, Optional
+
 
 SENATO_SPARQL_ENDPOINT = "https://dati.senato.it/sparql"
 
+# User-Agent "browser-like" per ridurre probabilità di 403/WAF
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/121.0.0.0 Safari/537.36"
+)
 
-# ---------- helpers HTTP / SPARQL ----------
 
-def _read_http_error_body(e: urllib.error.HTTPError, max_chars: int = 500) -> str:
+# ----------------------------
+# HTTP helpers
+# ----------------------------
+def _read_http_error_body(e: urllib.error.HTTPError, max_chars: int = 800) -> str:
     try:
-        b = e.read().decode("utf-8", errors="replace")
-        b = re.sub(r"\s+", " ", b).strip()
-        return b[:max_chars]
+        body = e.read().decode("utf-8", errors="replace")
+        body = re.sub(r"\s+", " ", body).strip()
+        return body[:max_chars]
     except Exception:
         return "(impossibile leggere body)"
 
 
-def _sparql_get_json(query: str, timeout_s: int = 25) -> Dict[str, Any]:
+def _http_get(url: str, timeout_s: int = 25) -> str:
     headers = {
-        "Accept": "application/sparql-results+json",
-        "Accept-Language": "it-IT,it;q=0.9,en;q=0.8",
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) parl-maritime-monitor/0.2",
+        "User-Agent": UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.7,en;q=0.6",
+        "Referer": "https://dati.senato.it/sparql",
     }
-    params = urllib.parse.urlencode(
-        {"query": query, "format": "application/sparql-results+json"},
-        quote_via=urllib.parse.quote,
-    )
-    url = f"{SENATO_SPARQL_ENDPOINT}?{params}"
     req = urllib.request.Request(url, headers=headers, method="GET")
     with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+        return resp.read().decode("utf-8", errors="replace")
 
 
-def _sparql_post_json(query: str, timeout_s: int = 25) -> Dict[str, Any]:
-    # Solo come fallback: su GH Actions può essere bloccato
+def _sparql_request_json(query: str, timeout_s: int = 25) -> Dict[str, Any]:
+    """
+    SPARQL via GET con format JSON.
+    (Evitiamo varianti output=csv che possono cambiare il comportamento su Virtuoso.)
+    """
+    params = urllib.parse.urlencode(
+        {
+            "query": query,
+            "format": "application/sparql-results+json",
+        }
+    )
+    url = f"{SENATO_SPARQL_ENDPOINT}?{params}"
+
     headers = {
+        "User-Agent": UA,
         "Accept": "application/sparql-results+json",
-        "Accept-Language": "it-IT,it;q=0.9,en;q=0.8",
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) parl-maritime-monitor/0.2",
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.7,en;q=0.6",
+        "Referer": "https://dati.senato.it/sparql",
     }
-    data = urllib.parse.urlencode({"query": query}).encode("utf-8")
-    req = urllib.request.Request(SENATO_SPARQL_ENDPOINT, data=data, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-        return json.loads(resp.read().decode("utf-8"))
 
-
-def _sparql_json(query: str, timeout_s: int = 25) -> Dict[str, Any]:
-    # GET-first (perché POST viene spesso 403 da GitHub Actions)
+    req = urllib.request.Request(url, headers=headers, method="GET")
     try:
-        return _sparql_get_json(query, timeout_s=timeout_s)
-    except urllib.error.HTTPError as e_get:
-        body_get = _read_http_error_body(e_get)
-        # prova POST una sola volta
-        try:
-            return _sparql_post_json(query, timeout_s=timeout_s)
-        except urllib.error.HTTPError as e_post:
-            body_post = _read_http_error_body(e_post)
-            raise RuntimeError(
-                f"SPARQL GET HTTP {e_get.code}: {body_get} | POST HTTP {e_post.code}: {body_post}"
-            ) from e_post
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            payload = resp.read().decode("utf-8", errors="replace")
+            return json.loads(payload)
+    except urllib.error.HTTPError as e:
+        body = _read_http_error_body(e)
+        raise RuntimeError(f"HTTP {e.code} su SPARQL GET. Body: {body}")
 
 
-def _request_with_retries(query: str, timeout_s: int = 25, retries: int = 3, backoff_s: int = 4) -> Dict[str, Any]:
+def _request_with_retries(query: str, retries: int = 3, backoff_s: int = 4) -> Dict[str, Any]:
     last_err: Optional[Exception] = None
     for attempt in range(1, retries + 1):
         try:
-            return _sparql_json(query=query, timeout_s=timeout_s)
+            return _sparql_request_json(query=query, timeout_s=25)
         except Exception as e:
             last_err = e
             if attempt < retries:
@@ -94,140 +97,140 @@ def _bindings_to_rows(bindings: List[Dict[str, Any]]) -> List[Dict[str, str]]:
     return rows
 
 
-# ---------- link builders ----------
-
-def _ddl_did_from_uri(uri: str) -> str:
-    m = re.search(r"/ddl/(\d+)", uri)
-    return m.group(1) if m else uri.rsplit("/", 1)[-1]
-
-
-def _senato_ddl_page(did: str) -> str:
-    return f"https://www.senato.it/leggi-e-documenti/disegni-di-legge/scheda-ddl?did={did}"
-
-
-def _sindisp_showdoc_from_url(url: str, fallback_leg: str = "19") -> str:
-    # es: http://www.senato.it/loc/link.asp?tipodoc=sindisp&leg=19&id=1496581
-    try:
-        p = urllib.parse.urlparse(url)
-        qs = urllib.parse.parse_qs(p.query)
-        leg = (qs.get("leg", [fallback_leg])[0] or fallback_leg).strip()
-        doc_id = (qs.get("id", [""])[0] or "").strip()
-        tipodoc = (qs.get("tipodoc", ["Sindisp"])[0] or "Sindisp").strip()
-        tipodoc = "Sindisp" if tipodoc.lower().startswith("sind") else tipodoc
-        if doc_id:
-            return f"https://www.senato.it/show-doc?tipodoc={tipodoc}&leg={leg}&id={doc_id}"
-    except Exception:
-        pass
-
-    # fallback: prova a estrarre un id numerico
-    m = re.search(r"(\d{6,})", url)
-    doc_id = m.group(1) if m else ""
-    return f"https://www.senato.it/show-doc?tipodoc=Sindisp&leg={fallback_leg}&id={doc_id}" if doc_id else url
-
-
-# ---------- fallback parsing show-doc (se SPARQL dettagli fallisce) ----------
-
-class _HTMLText(HTMLParser):
+# ----------------------------
+# HTML -> text helper
+# ----------------------------
+class _HTMLTextExtractor(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
-        self.parts: List[str] = []
-        self._newline_tags = {"br", "p", "div", "li", "tr", "h1", "h2", "h3"}
-
-    def handle_starttag(self, tag: str, attrs) -> None:
-        if tag in self._newline_tags:
-            self.parts.append("\n")
+        self._chunks: List[str] = []
 
     def handle_data(self, data: str) -> None:
-        self.parts.append(data)
+        if data:
+            self._chunks.append(data)
 
     def get_text(self) -> str:
-        txt = "".join(self.parts)
-        txt = re.sub(r"\n{3,}", "\n\n", txt)
-        return txt
+        text = "\n".join(self._chunks)
+        text = re.sub(r"[ \t]+", " ", text)
+        text = re.sub(r"\n{2,}", "\n", text)
+        return text.strip()
 
 
-def _fetch_showdoc_text(url: str, timeout_s: int = 25) -> str:
-    headers = {
-        "Accept": "text/html,application/xhtml+xml",
-        "Accept-Language": "it-IT,it;q=0.9,en;q=0.8",
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) parl-maritime-monitor/0.2",
-    }
-    req = urllib.request.Request(url, headers=headers, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-        html_bytes = resp.read()
-    parser = _HTMLText()
-    parser.feed(html_bytes.decode("utf-8", errors="replace"))
-    return parser.get_text()
+def _html_to_text(html: str) -> str:
+    p = _HTMLTextExtractor()
+    p.feed(html)
+    return p.get_text()
 
 
-def _parse_sindisp_from_showdoc(text: str) -> Dict[str, str]:
-    # Cerca riga tipo: "COGNOME (GRUPPO) - Al Ministro ..."
-    proponente = ""
-    gruppo = ""
-    destinatario = ""
-    titolo = ""
-
-    lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.splitlines()]
-    lines = [ln for ln in lines if ln]
-
-    dash_line = next((ln for ln in lines[:50] if " - Al " in ln or " - Alla " in ln), "")
-    if dash_line:
-        m = re.match(r"^([A-ZÀ-Ü'\s]+?)(?:\s*\(([^)]+)\))?\s*-\s*(Al(?:la)?\s+.+)$", dash_line)
-        if m:
-            proponente = m.group(1).strip()
-            gruppo = (m.group(2) or "").strip()
-            destinatario = m.group(3).strip().rstrip(".")
-        else:
-            parts = dash_line.split(" - ", 1)
-            proponente = parts[0].strip()
-            destinatario = parts[1].strip().rstrip(".") if len(parts) > 1 else ""
-
-    # Stato “minimo”: se c'è una sezione RISPOSTA nella pagina
-    stato = "Risposta presente" if re.search(r"\bRISPOSTA\b", text, flags=re.IGNORECASE) else ""
-
-    # Titolo/oggetto se esiste una riga "Oggetto: ..."
-    obj_line = next((ln for ln in lines[:160] if ln.lower().startswith("oggetto")), "")
-    if obj_line and ":" in obj_line:
-        titolo = obj_line.split(":", 1)[-1].strip()
-
-    return {"proponente": proponente, "gruppo": gruppo, "destinatario": destinatario, "stato": stato, "titolo": titolo}
+# ----------------------------
+# Sindacato Ispettivo enrichment (show-doc)
+# ----------------------------
+_DATE_PUB_RE = re.compile(r"Pubblicat[oa]\s+il\s+(\d{1,2}/\d{1,2}/\d{4})", re.IGNORECASE)
+_PRESENTATA_RE = re.compile(r"Presentata\s+da:\s*(.+)", re.IGNORECASE)
+_GRUPPO_RE = re.compile(r"Gruppo:\s*(.+)", re.IGNORECASE)
+_STATO_RE = re.compile(r"Stato:\s*(.+)", re.IGNORECASE)
+_OGGETTO_RE = re.compile(r"(Oggetto|Titolo):\s*(.+)", re.IGNORECASE)
 
 
-def _fetch_sindisp_details_via_sparql(act_uri: str) -> Dict[str, str]:
-    # Query molto corta “per singolo atto” -> evita URL lunghi
-    q = f"""
-PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-SELECT ?titolo ?dest ?prop ?grLabel ?stato
-WHERE {{
-  VALUES ?s {{ <{act_uri}> }}
-  OPTIONAL {{ ?s <http://dati.senato.it/osr/titolo> ?titolo . }}
-  OPTIONAL {{ ?s <http://dati.senato.it/osr/destinatario> ?dest . }}
-  OPTIONAL {{ ?s <http://dati.senato.it/osr/indirizzataA> ?dest . }}
-  OPTIONAL {{ ?s <http://dati.senato.it/osr/descrIniziativa> ?prop . }}
-  OPTIONAL {{ ?s <http://dati.senato.it/osr/gruppo> ?gr . OPTIONAL {{ ?gr rdfs:label ?grLabel }} }}
-  OPTIONAL {{ ?s <http://dati.senato.it/osr/gruppoParlamentare> ?gr2 . OPTIONAL {{ ?gr2 rdfs:label ?grLabel }} }}
-  OPTIONAL {{ ?s <http://dati.senato.it/osr/esito> ?stato . }}
-  OPTIONAL {{ ?s <http://dati.senato.it/osr/stato> ?stato . }}
-}}
-LIMIT 1
-""".strip()
-
-    res = _request_with_retries(q, retries=2, backoff_s=2)
-    rows = _bindings_to_rows(res.get("results", {}).get("bindings", []))
-    if not rows:
-        return {}
-    r = rows[0]
-    return {
-        "titolo": (r.get("titolo", "") or "").strip(),
-        "destinatario": (r.get("dest", "") or "").strip(),
-        "proponente": (r.get("prop", "") or "").strip(),
-        "gruppo": (r.get("grLabel", "") or "").strip(),
-        "stato": (r.get("stato", "") or "").strip(),
-    }
+def _parse_ddmmyyyy(s: str) -> Optional[date]:
+    try:
+        d = datetime.strptime(s.strip(), "%d/%m/%Y").date()
+        return d
+    except Exception:
+        return None
 
 
-# ---------- main entrypoint ----------
+def _extract_first_line_after_label(text: str, regex: re.Pattern) -> str:
+    m = regex.search(text)
+    if not m:
+        return ""
+    # prendiamo solo la prima riga “sensata”
+    line = m.group(1).strip()
+    line = line.split("\n", 1)[0].strip()
+    return line
 
+
+def _extract_destinatario(text: str) -> str:
+    """
+    In molti Sindisp, subito sotto l'intestazione compare una riga tipo:
+    "Al Ministro della salute ..."
+    Oppure "Ai Ministri ..."
+    Prendiamo la prima riga che inizia con Al/Ai/Alla/Alle.
+    """
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    for ln in lines[:80]:
+        if re.match(r"^(Al|Ai|Alla|Alle|All')\s", ln):
+            # evita falsi positivi banali
+            if "Ministr" in ln or "Presidente" in ln or "Governo" in ln:
+                return ln
+    return ""
+
+
+def _build_showdoc_url(urltesto: str, legislatura: str) -> str:
+    """
+    Trasforma ...loc/link.asp?...&id=1496xxx in show-doc?tipodoc=Sindisp&leg=19&id=...
+    Se non riesce, restituisce urltesto.
+    """
+    try:
+        parsed = urllib.parse.urlparse(urltesto)
+        q = urllib.parse.parse_qs(parsed.query)
+        act_id = (q.get("id") or [""])[0]
+        leg = (q.get("leg") or [legislatura or "19"])[0]
+        if act_id:
+            return f"https://www.senato.it/show-doc?tipodoc=Sindisp&leg={leg}&id={act_id}"
+    except Exception:
+        pass
+    return urltesto
+
+
+def _enrich_sindisp_with_showdoc(item: Dict[str, str]) -> Dict[str, str]:
+    """
+    Scarica show-doc e aggiunge:
+    - publication_date (dd/mm/yyyy)
+    - destinatario
+    - proponente
+    - gruppo
+    - stato
+    - titolo (se presente)
+    """
+    urltesto = item.get("url", "").strip()
+    leg = (item.get("leg", "") or "19").strip()
+
+    show_url = _build_showdoc_url(urltesto, leg)
+    item["url_direct"] = show_url
+
+    try:
+        html = _http_get(show_url, timeout_s=25)
+        text = _html_to_text(html)
+
+        # Data pubblicazione
+        m = _DATE_PUB_RE.search(text)
+        pub = m.group(1).strip() if m else ""
+        item["publication_date"] = pub
+
+        # Titolo / oggetto (se presente)
+        m2 = _OGGETTO_RE.search(text)
+        if m2:
+            item["title"] = (m2.group(2) or "").strip()
+
+        # Destinatario
+        item["destinatario"] = _extract_destinatario(text)
+
+        # Proponente / gruppo / stato
+        item["proponente"] = _extract_first_line_after_label(text, _PRESENTATA_RE)
+        item["gruppo"] = _extract_first_line_after_label(text, _GRUPPO_RE)
+        item["stato"] = _extract_first_line_after_label(text, _STATO_RE)
+
+    except Exception:
+        # Se fallisce l'enrichment, lasciamo solo quanto già abbiamo
+        pass
+
+    return item
+
+
+# ----------------------------
+# Main fetch
+# ----------------------------
 def fetch_senato_last_48h(
     limit_each: int = 10,
     days: int = 2,
@@ -235,147 +238,146 @@ def fetch_senato_last_48h(
     """
     Returns (ddls, sindacato_ispettivo, warnings)
 
-    NOTE: la parte “DDL” qui continua a funzionare come prima, ma ora:
-      - link DDL = scheda-ddl?did=...
-      - sindacato: niente query lunghissima -> niente 403 “da URL lungo”
+    Nota importante:
+    - Per Sindacato Ispettivo filtriamo sulle 48h *in base a "Pubblicato il"*
+      letto da show-doc (più coerente con quello che vedi nella ricerca manuale).
+    - SPARQL serve solo per prendere una lista recente "candidata".
     """
     warnings: List[str] = []
-    start_date = (date.today() - timedelta(days=days)).isoformat()  # YYYY-MM-DD
+    cutoff = date.today() - timedelta(days=days)
 
-    # --- DDL (quella che ti funzionava) ---
+    # --------
+    # DDL (lasciato “semplice” per ora)
+    # --------
     q_ddl = f"""
 PREFIX rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
-SELECT ?s ?titolo ?numeroFase ?fase ?data ?stato ?iniziativa
+
+SELECT ?s ?titolo ?numeroFase ?fase ?data
 WHERE {{
   ?s rdf:type <http://dati.senato.it/osr/Ddl> .
   OPTIONAL {{ ?s <http://dati.senato.it/osr/titolo> ?titolo . }}
   OPTIONAL {{ ?s <http://dati.senato.it/osr/numeroFase> ?numeroFase . }}
   OPTIONAL {{ ?s <http://dati.senato.it/osr/fase> ?fase . }}
   OPTIONAL {{ ?s <http://dati.senato.it/osr/dataPresentazione> ?data . }}
-  OPTIONAL {{ ?s <http://dati.senato.it/osr/statoDdl> ?stato . }}
-  OPTIONAL {{ ?s <http://dati.senato.it/osr/descrIniziativa> ?iniziativa . }}
-
-  FILTER(BOUND(?data))
-  FILTER(STR(?data) >= "{start_date}")
-}}
-ORDER BY DESC(?data)
-LIMIT {int(limit_each)}
-""".strip()
-
-    # --- Sindacato (LISTA CORTA) ---
-    q_sind_list = f"""
-PREFIX rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
-PREFIX xsd:  <http://www.w3.org/2001/XMLSchema#>
-
-SELECT ?s ?tipo ?numero ?data ?url ?leg
-WHERE {{
-  ?s rdf:type <http://dati.senato.it/osr/SindacatoIspettivo> .
-
-  OPTIONAL {{ ?s <http://dati.senato.it/osr/tipo> ?tipo . }}
-  OPTIONAL {{ ?s <http://dati.senato.it/osr/numero> ?numero . }}
-  OPTIONAL {{ ?s <http://dati.senato.it/osr/dataPresentazione> ?data . }}
-  OPTIONAL {{ ?s <http://dati.senato.it/osr/URLTesto> ?url . }}
-  OPTIONAL {{ ?s <http://dati.senato.it/osr/legislatura> ?leg . }}
-
-  FILTER(BOUND(?data))
-  FILTER(STR(?data) >= "{start_date}")
-
-  FILTER(
-    ?tipo = "Interrogazione con richiesta di risposta scritta"^^xsd:string ||
-    ?tipo = "Interrogazione"^^xsd:string ||
-    ?tipo = "Mozione"^^xsd:string ||
-    ?tipo = "Interpellanza"^^xsd:string ||
-    ?tipo = "Risoluzione in Assemblea"^^xsd:string ||
-    ?tipo = "Risoluzione autonoma in commissione"^^xsd:string
-  )
 }}
 ORDER BY DESC(?data)
 LIMIT {int(limit_each)}
 """.strip()
 
     ddls: List[Dict[str, str]] = []
-    sind: List[Dict[str, str]] = []
-
-    # ---- DDL ----
     try:
         res = _request_with_retries(q_ddl)
         rows = _bindings_to_rows(res.get("results", {}).get("bindings", []))
         for r in rows:
-            act_uri = (r.get("s", "") or "").strip()
+            act_uri = r.get("s", "")
             titolo = (r.get("titolo", "") or "").strip() or "(senza titolo)"
             numero = (r.get("numeroFase", "") or "").strip()
             fase = (r.get("fase", "") or "").strip()
             data_pres = (r.get("data", "") or "").strip()
-            stato = (r.get("stato", "") or "").strip()
-            iniziativa = (r.get("iniziativa", "") or "").strip()
 
-            act_id = f"DDL {numero}".strip() if numero else (fase if fase else "DDL")
-            did = _ddl_did_from_uri(act_uri) if act_uri else ""
-            page = _senato_ddl_page(did) if did else act_uri
+            act_id = f"DDL {numero}" if numero else (fase if fase else "DDL")
 
             ddls.append(
                 {
                     "branch": "Senato",
                     "act_id": act_id,
                     "title": titolo,
-                    "url": page,            # link “scheda-ddl?did=…”
-                    "date": data_pres,      # data presentazione
-                    "initiative": iniziativa,
-                    "state": stato,
+                    "url": act_uri,
+                    "why": "SPARQL Senato (DDL)",
+                    "date": data_pres,
                 }
             )
     except Exception as e:
         warnings.append(f"Query DDL fallita su SPARQL Senato: {type(e).__name__}: {e}")
 
-    # ---- Sindacato Ispettivo ----
+    # --------
+    # Sindacato Ispettivo: SPARQL “leggero” + enrichment show-doc + filtro su pubblicazione
+    # --------
+    q_sind_light = f"""
+PREFIX rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+
+SELECT ?s ?tipo ?numero ?data ?leg ?url
+WHERE {{
+  ?s rdf:type <http://dati.senato.it/osr/SindacatoIspettivo> .
+  OPTIONAL {{ ?s <http://dati.senato.it/osr/tipo> ?tipo . }}
+  OPTIONAL {{ ?s <http://dati.senato.it/osr/numero> ?numero . }}
+  OPTIONAL {{ ?s <http://dati.senato.it/osr/dataPresentazione> ?data . }}
+  OPTIONAL {{ ?s <http://dati.senato.it/osr/legislatura> ?leg . }}
+  OPTIONAL {{ ?s <http://dati.senato.it/osr/URLTesto> ?url . }}
+}}
+ORDER BY DESC(?data)
+LIMIT 200
+""".strip()
+
+    sind: List[Dict[str, str]] = []
     try:
-        res = _request_with_retries(q_sind_list)
+        res = _request_with_retries(q_sind_light)
         rows = _bindings_to_rows(res.get("results", {}).get("bindings", []))
 
+        # 1) normalizza base
+        candidates: List[Dict[str, str]] = []
         for r in rows:
-            act_uri = (r.get("s", "") or "").strip()
-            tipo = (r.get("tipo", "") or "").strip() or "Sindacato ispettivo"
+            tipo = (r.get("tipo", "") or "").strip()
             numero = (r.get("numero", "") or "").strip()
             data_pres = (r.get("data", "") or "").strip()
-            url = (r.get("url", "") or "").strip()
-            leg = (r.get("leg", "") or "").strip() or "19"
+            leg = (r.get("leg", "") or "19").strip()
+            urltesto = (r.get("url", "") or "").strip()
 
-            showdoc = _sindisp_showdoc_from_url(url or act_uri, fallback_leg=leg)
+            # filtra per i tipi che ti interessano (ma usando STR, non literal typed)
+            if tipo not in {
+                "Interrogazione con richiesta di risposta scritta",
+                "Interrogazione",
+                "Mozione",
+                "Interpellanza",
+                "Risoluzione in Assemblea",
+                "Risoluzione autonoma in commissione",
+            }:
+                continue
 
-            details: Dict[str, str] = {}
-            # 1) prova dettagli via SPARQL per singolo atto (query corta)
-            try:
-                if act_uri:
-                    details = _fetch_sindisp_details_via_sparql(act_uri)
-            except Exception:
-                details = {}
-
-            # 2) fallback: parse show-doc
-            if not details:
-                try:
-                    txt = _fetch_showdoc_text(showdoc)
-                    details = _parse_sindisp_from_showdoc(txt)
-                except Exception:
-                    details = {}
-
-            sind.append(
+            candidates.append(
                 {
                     "branch": "Senato",
-                    "act_id": f"{tipo} {numero}".strip(),
-                    "title": (details.get("titolo") or "").strip(),   # se presente
-                    "url": showdoc,                                   # link diretto show-doc
-                    "date": data_pres,                                # data presentazione
-                    "type": tipo,
-                    "number": numero,
-                    "to": (details.get("destinatario") or "").strip(),
-                    "proposer": (details.get("proponente") or "").strip(),
-                    "group": (details.get("gruppo") or "").strip(),
-                    "state": (details.get("stato") or "").strip(),
+                    "tipo": tipo,
+                    "numero": numero,
+                    "date_presentazione": data_pres,
+                    "leg": leg,
+                    "url": urltesto,
+                    "why": "SPARQL Senato (Sindacato ispettivo, light) + show-doc",
                 }
             )
 
-            # micro rate-limit: evitiamo di martellare il sito
-            time.sleep(0.6)
+        # 2) enrichment show-doc + filtro su "Pubblicato il" nelle ultime 48h
+        for item in candidates:
+            enriched = _enrich_sindisp_with_showdoc(item)
+
+            pub_s = (enriched.get("publication_date") or "").strip()
+            pub_d = _parse_ddmmyyyy(pub_s) if pub_s else None
+
+            # Se non riesco a leggere la data pubblicazione, lo tengo “borderline”
+            if pub_d is None:
+                continue
+
+            if pub_d >= cutoff:
+                # act_id per output: "Interrogazione ... 3-xxxxx"
+                act_id = f"{enriched.get('tipo','Sindisp')} {enriched.get('numero','')}".strip()
+
+                sind.append(
+                    {
+                        "branch": "Senato",
+                        "act_id": act_id,
+                        "title": (enriched.get("title") or "").strip(),
+                        "destinatario": (enriched.get("destinatario") or "").strip(),
+                        "proponente": (enriched.get("proponente") or "").strip(),
+                        "gruppo": (enriched.get("gruppo") or "").strip(),
+                        "stato": (enriched.get("stato") or "").strip(),
+                        "date_pubblicazione": pub_s,
+                        "url": enriched.get("url_direct") or enriched.get("url") or "",
+                        "why": enriched.get("why") or "",
+                    }
+                )
+
+        # limita output finale
+        sind = sind[: int(limit_each)]
 
     except Exception as e:
         warnings.append(f"Query Sindacato Ispettivo fallita su SPARQL Senato: {type(e).__name__}: {e}")
