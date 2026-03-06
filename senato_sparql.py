@@ -182,7 +182,7 @@ def _enrich_ddl_commissione(url: str) -> str:
 # -------------------------
 
 def fetch_senato_last_48h(
-    limit_each: int = 10,
+    limit_each: int = 200,
     days: int = 2,
 ) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], List[str]]:
     warnings: List[str] = []
