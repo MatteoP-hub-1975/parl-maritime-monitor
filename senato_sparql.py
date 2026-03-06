@@ -50,8 +50,8 @@ def _strip_html_to_text(html: str) -> str:
 
 def _url_looks_ok(url: str, timeout_s: int = 12) -> bool:
     """
-    True se la pagina sembra valida (no 403/404 e no pagina errore).
-    Legge solo i primi byte per essere leggero.
+    True se la pagina sembra valida (non 403/404 e non pagina Errore_403 / not found).
+    Legge solo i primi bytes (Range) per non appesantire.
     """
     if not url:
         return False
@@ -79,10 +79,11 @@ def _url_looks_ok(url: str, timeout_s: int = 12) -> bool:
 
     bad_markers = [
         "errore_403",
+        "http 403",
         "accesso negato",
         "pagina non trovata",
-        "http 403",
-        "404",
+        ">404<",
+        "not found",
     ]
     return not any(b in chunk for b in bad_markers)
 
@@ -107,20 +108,29 @@ def _sparql_request_json(query: str, timeout_s: int = 25) -> Dict[str, Any]:
         "Connection": "close",
     }
 
-    # 1) GET (preferito)
-    try:
-        params = urllib.parse.urlencode(
-            {"query": query, "format": "application/sparql-results+json"}
-        )
-        url = f"{SENATO_SPARQL_ENDPOINT}?{params}"
-        req = urllib.request.Request(url, headers=headers, method="GET")
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            payload = resp.read().decode("utf-8", errors="replace")
-            return json.loads(payload)
-    except urllib.error.HTTPError as he:
-        # fallback a POST solo su errori comuni
-        if he.code not in (400, 403):
-            raise
+    # 1) GET (con varianti per Virtuoso)
+    get_variants = [
+        {"query": query, "format": "application/sparql-results+json"},
+        {"query": query, "output": "application/sparql-results+json"},
+        {"query": query},
+    ]
+
+    last_http_err: Optional[urllib.error.HTTPError] = None
+    for params_dict in get_variants:
+        try:
+            params = urllib.parse.urlencode(params_dict)
+            url = f"{SENATO_SPARQL_ENDPOINT}?{params}"
+            req = urllib.request.Request(url, headers=headers, method="GET")
+            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                payload = resp.read().decode("utf-8", errors="replace")
+                return json.loads(payload)
+        except urllib.error.HTTPError as he:
+            last_http_err = he
+            # se non è 400/403, rilancia
+            if he.code not in (400, 403):
+                raise
+        except Exception:
+            continue
 
     # 2) POST fallback
     data = urllib.parse.urlencode({"query": query}).encode("utf-8")
@@ -175,8 +185,8 @@ def _bindings_to_rows(bindings: List[Dict[str, Any]]) -> List[Dict[str, str]]:
 
 def _extract_sindisp_doc_id(url: str) -> str:
     """
-    Estrae l'id SOLO se presente come parametro id=... nella querystring.
-    (Evitiamo i falsi positivi e gli id "fantasma".)
+    Estrae l'id SOLO se è presente come parametro 'id=' nella querystring.
+    (No fallback su numeri “a caso”, no fallback su URI RDF)
     """
     if not url:
         return ""
@@ -288,7 +298,9 @@ LIMIT 500
     ddls: List[Dict[str, str]] = []
     sind: List[Dict[str, str]] = []
 
-    # ---- DDL fetch ----
+    # -------------------------
+    # DDL fetch
+    # -------------------------
     try:
         res = _request_with_retries(q_ddl)
         rows = _bindings_to_rows(res.get("results", {}).get("bindings", []))
@@ -325,23 +337,26 @@ LIMIT 500
     except Exception as e:
         warnings.append(f"Query DDL fallita su SPARQL Senato: {type(e).__name__}: {e}")
 
-    # ---- Sindacato fetch (dedup + show-doc solo se valido) ----
+    # -------------------------
+    # Sindacato fetch (NO duplicati rotti)
+    # -------------------------
     try:
         res = _request_with_retries(q_sind)
         rows = _bindings_to_rows(res.get("results", {}).get("bindings", []))
 
-        # dedup per (leg, numero) -> così eliminiamo duplicati anche se cambia "tipo"
+        # dedup per (leg, numero) — il tipo può cambiare stringa e generare duplicati
         sind_map: Dict[Tuple[str, str], Dict[str, str]] = {}
         showdoc_ok_cache: Dict[str, bool] = {}
 
-        def _score_url(u: str) -> int:
-            if not u:
-                return 0
-            if "show-doc" in u:
-                return 3
+        def _score(item: Dict[str, str]) -> int:
+            u = (item.get("url") or "")
             if "loc/link.asp" in u:
-                return 2
-            return 1
+                return 3  # spesso è quello che funziona sempre
+            if "show-doc" in u:
+                return 2  # ok solo se validato
+            if u:
+                return 1
+            return 0
 
         for r in rows:
             act_uri = (r.get("s", "") or "").strip()
@@ -352,10 +367,11 @@ LIMIT 500
             leg = (r.get("leg", "") or "19").strip()
             urltesto = (r.get("url", "") or "").strip()
 
-            # doc_id SOLO da URLTesto (non da act_uri)
+            # 1) doc_id SOLO da URLTesto (strict)
             doc_id = _extract_sindisp_doc_id(urltesto)
             url_showdoc = _build_sindisp_showdoc_url(doc_id, leg) if doc_id else ""
 
+            # 2) show-doc solo se valido, altrimenti URLTesto
             url_direct = ""
             if url_showdoc:
                 ok = showdoc_ok_cache.get(url_showdoc)
@@ -365,7 +381,6 @@ LIMIT 500
                 if ok:
                     url_direct = url_showdoc
 
-            # fallback: se show-doc non ok -> URLTesto -> act_uri
             if not url_direct:
                 url_direct = urltesto or act_uri
 
@@ -388,11 +403,10 @@ LIMIT 500
             if prev is None:
                 sind_map[key] = item
             else:
-                # preferisci link migliore
-                if _score_url(item["url"]) > _score_url(prev["url"]):
+                # scegli il migliore per link; a parità, preferisci tipo più “specifico” (stringa più lunga)
+                if _score(item) > _score(prev):
                     sind_map[key] = item
-                elif _score_url(item["url"]) == _score_url(prev["url"]):
-                    # a parità di link, preferisci tipo più specifico (stringa più lunga)
+                elif _score(item) == _score(prev):
                     if len(item.get("tipo", "")) > len(prev.get("tipo", "")):
                         sind_map[key] = item
 
