@@ -154,7 +154,7 @@ def main() -> None:
     senato_sind = []
     if senato_up:
         try:
-            ddls, sind, warn = fetch_senato_last_48h(limit_each=10, days=2)
+            ddls, sind, warn = fetch_senato_last_48h(limit_each=200, days=2)
             senato_ddls = ddls
             senato_sind = sind
             SOURCES_WARNINGS.extend(warn)
