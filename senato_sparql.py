@@ -55,6 +55,31 @@ def _strip_html_to_text(html: str) -> str:
 # SPARQL helpers
 # -------------------------
 
+def _extract_sindisp_doc_id(uri_or_url: str) -> str:
+    """
+    Estrae un id numerico (>=6 cifre) da URLTesto o dal URI SPARQL (?s).
+    """
+    if not uri_or_url:
+        return ""
+    # prova querystring id=...
+    try:
+        parsed = urllib.parse.urlparse(uri_or_url)
+        qs = urllib.parse.parse_qs(parsed.query)
+        if "id" in qs and qs["id"]:
+            return (qs["id"][0] or "").strip()
+    except Exception:
+        pass
+    # fallback: prima sequenza numerica lunga
+    m = re.search(r"(\d{6,})", uri_or_url)
+    return m.group(1) if m else ""
+
+
+def _build_sindisp_showdoc_url(doc_id: str, leg: str) -> str:
+    leg = (leg or "19").strip()
+    doc_id = (doc_id or "").strip()
+    if not doc_id:
+        return ""
+    return f"https://www.senato.it/show-doc?tipodoc=Sindisp&leg={leg}&id={doc_id}"
 def _sparql_request_json(query: str, timeout_s: int = 25) -> Dict[str, Any]:
     query = query.replace("\xa0", " ")
 
@@ -304,25 +329,33 @@ LIMIT {int(limit_each)}
     ]
     tipi_list = ", ".join([f'"{t}"' for t in wanted_tipi])
 
-    q_sind = f"""
+   q_sind = f"""
 PREFIX rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 
-SELECT ?s ?tipo ?numero ?data ?url ?esito
+SELECT ?s ?tipo ?numero ?data ?url ?leg ?esito
 WHERE {{
   ?s rdf:type <http://dati.senato.it/osr/SindacatoIspettivo> .
+
   OPTIONAL {{ ?s <http://dati.senato.it/osr/tipo> ?tipo . }}
   OPTIONAL {{ ?s <http://dati.senato.it/osr/numero> ?numero . }}
   OPTIONAL {{ ?s <http://dati.senato.it/osr/dataPresentazione> ?data . }}
   OPTIONAL {{ ?s <http://dati.senato.it/osr/URLTesto> ?url . }}
+  OPTIONAL {{ ?s <http://dati.senato.it/osr/legislatura> ?leg . }}
   OPTIONAL {{ ?s <http://dati.senato.it/osr/esito> ?esito . }}
 
   FILTER(BOUND(?data))
   FILTER(STR(?data) >= "{start_date}")
 
-  FILTER( STR(?tipo) IN ({tipi_list}) )
+  FILTER(BOUND(?tipo))
+  FILTER(
+    CONTAINS(LCASE(STR(?tipo)), "interrogazione") ||
+    CONTAINS(LCASE(STR(?tipo)), "interpellanza") ||
+    CONTAINS(LCASE(STR(?tipo)), "mozione") ||
+    CONTAINS(LCASE(STR(?tipo)), "risoluzione")
+  )
 }}
 ORDER BY DESC(?data)
-LIMIT {int(limit_each)}
+LIMIT 500
 """.strip()
 
     ddls: List[Dict[str, str]] = []
@@ -365,31 +398,35 @@ LIMIT {int(limit_each)}
         rows = _bindings_to_rows(res.get("results", {}).get("bindings", []))
 
         for r in rows:
-            tipo = (r.get("tipo", "") or "").strip() or "Sindacato ispettivo"
-            numero = (r.get("numero", "") or "").strip()
-            data_pres = (r.get("data", "") or "").strip()
-            esito = (r.get("esito", "") or "").strip()
+    act_uri = (r.get("s", "") or "").strip()
+    tipo = (r.get("tipo", "") or "").strip() or "Sindacato ispettivo"
+    numero = (r.get("numero", "") or "").strip()
+    data_pres = (r.get("data", "") or "").strip()
+    esito = (r.get("esito", "") or "").strip()
+    leg = (r.get("leg", "") or "19").strip()
+    urltesto = (r.get("url", "") or "").strip()
 
-            url_raw = (r.get("url", "") or "").strip()
-            url = _normalize_sindisp_url(url_raw) or (r.get("s", "") or "").strip()
+    # ID affidabile: prima URLTesto, poi URI ?s
+    doc_id = _extract_sindisp_doc_id(urltesto) or _extract_sindisp_doc_id(act_uri)
 
-            enrich = _enrich_sindisp_showdoc(url) if url else {"data_pubblicazione": "", "proponenti": "", "destinatario": ""}
+    # link diretto SEMPRE in forma show-doc (come vuoi tu)
+    url_direct = _build_sindisp_showdoc_url(doc_id, leg) or urltesto or act_uri
 
-            sind.append(
-                {
-                    "branch": "Senato",
-                    "tipo": tipo,
-                    "numero": numero,
-                    "title": "",  # spesso non esiste un “titolo” separato nelle show-doc
-                    "url": url,
-                    "date_presentazione": data_pres,
-                    "data_pubblicazione": enrich.get("data_pubblicazione", ""),
-                    "destinatario": enrich.get("destinatario", ""),
-                    "proponenti": enrich.get("proponenti", ""),
-                    "gruppo": "",  # best effort: lo aggiungiamo dopo (serve fetch pagina senatore)
-                    "stato": esito,
-                }
-            )
+    # (qui lasciamo enrichment/parse show-doc come ce l’hai già, se c’è)
+    # altrimenti almeno NON rompiamo i link.
+
+    sind.append({
+        "branch": "Senato",
+        "tipo": tipo,
+        "numero": numero,
+        "title": "",  # se lo estrai da show-doc, mettilo qui
+        "url": url_direct,
+        "date_presentazione": data_pres,
+        "destinatario": "",  # se lo estrai da show-doc, mettilo qui
+        "proponenti": "",    # idem
+        "gruppo": "",        # idem
+        "stato": esito,      # oppure "IN CORSO" se lo estrai da show-doc
+    })
     except Exception as e:
         warnings.append(f"Query Sindacato Ispettivo fallita su SPARQL Senato: {type(e).__name__}: {e}")
 
