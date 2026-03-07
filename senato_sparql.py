@@ -9,11 +9,18 @@ from typing import Any
 
 SPARQL_ENDPOINT = "https://dati.senato.it/sparql"
 
-USER_AGENT = "parl-maritime-monitor/0.2 (GitHub Actions)"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/122.0.0.0 Safari/537.36"
+)
 
 DEFAULT_HEADERS = {
     "User-Agent": USER_AGENT,
     "Accept": "application/sparql-results+json, application/json, text/html;q=0.9, */*;q=0.8",
+    "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": "https://dati.senato.it/",
+    "Connection": "close",
 }
 
 PREFIXES = """
@@ -29,47 +36,11 @@ WARNINGS: list[str] = []
 
 
 # =========================
-# HTTP / SPARQL UTILS
+# BASIC UTILS
 # =========================
-
-def http_get(url: str, timeout_s: int = 30) -> str:
-    req = urllib.request.Request(url, headers=DEFAULT_HEADERS, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-        return resp.read().decode("utf-8", errors="replace")
-
-
-def http_post(url: str, data: bytes, content_type: str, timeout_s: int = 60) -> str:
-    headers = dict(DEFAULT_HEADERS)
-    headers["Content-Type"] = content_type
-    req = urllib.request.Request(url, headers=headers, data=data, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-        return resp.read().decode("utf-8", errors="replace")
-
-
-def sparql_select(query: str, timeout_s: int = 90) -> list[dict[str, str]]:
-    body = urllib.parse.urlencode({"query": query, "format": "application/sparql-results+json"}).encode("utf-8")
-    raw = http_post(
-        SPARQL_ENDPOINT,
-        data=body,
-        content_type="application/x-www-form-urlencoded; charset=UTF-8",
-        timeout_s=timeout_s,
-    )
-    payload = json.loads(raw)
-    rows: list[dict[str, str]] = []
-    for b in payload.get("results", {}).get("bindings", []):
-        row: dict[str, str] = {}
-        for k, v in b.items():
-            row[k] = v.get("value", "")
-        rows.append(row)
-    return rows
-
 
 def safe_str(v: Any) -> str:
     return str(v).strip() if v is not None else ""
-
-
-def chunks(seq: list[Any], size: int) -> list[list[Any]]:
-    return [seq[i:i + size] for i in range(0, len(seq), size)]
 
 
 def iso_cutoff(days: int) -> str:
@@ -84,12 +55,51 @@ def html_to_lines(raw_html: str) -> list[str]:
     s = re.sub(r"(?i)</(p|div|h1|h2|h3|li|tr|td|section|article|br|span)>", "\n", s)
     s = re.sub(r"(?s)<[^>]+>", " ", s)
     s = html.unescape(s)
+
     lines = []
     for line in s.splitlines():
         line = re.sub(r"\s+", " ", line).strip()
         if line:
             lines.append(line)
     return lines
+
+
+# =========================
+# HTTP / SPARQL
+# =========================
+
+def http_get(url: str, timeout_s: int = 30, retries: int = 3, backoff_s: float = 2.0) -> str:
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(url, headers=DEFAULT_HEADERS, method="GET")
+            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                return resp.read().decode("utf-8", errors="replace")
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                time.sleep(backoff_s * attempt)
+            else:
+                raise last_err
+
+
+def sparql_select(query: str, timeout_s: int = 90) -> list[dict[str, str]]:
+    params = urllib.parse.urlencode({
+        "query": query,
+        "format": "application/sparql-results+json",
+    })
+    url = f"{SPARQL_ENDPOINT}?{params}"
+
+    raw = http_get(url, timeout_s=timeout_s, retries=3, backoff_s=3.0)
+    payload = json.loads(raw)
+
+    rows: list[dict[str, str]] = []
+    for b in payload.get("results", {}).get("bindings", []):
+        row: dict[str, str] = {}
+        for k, v in b.items():
+            row[k] = v.get("value", "")
+        rows.append(row)
+    return rows
 
 
 # =========================
@@ -111,11 +121,6 @@ def extract_leg_from_url(url: str) -> str:
 
 
 def extract_lodview_urltesto(lodview_url: str) -> tuple[str, str]:
-    """
-    Da un URL tipo:
-    https://dati.senato.it/sindacatoispettivo/142812
-    prova a leggere la pagina LodView e ad estrarre leg/docid del link testo.
-    """
     if not lodview_url:
         return "", ""
 
@@ -239,7 +244,7 @@ def parse_sindisp_showdoc(showdoc_url: str) -> dict[str, str]:
 
 
 # =========================
-# QUERIES: DDL
+# DDL
 # =========================
 
 def query_ddls_last_days(limit_each: int, days: int) -> list[dict[str, str]]:
@@ -324,7 +329,7 @@ def dedupe_ddls(items: list[dict[str, str]]) -> list[dict[str, str]]:
 
 
 # =========================
-# QUERIES: SINDISP
+# SINDISP
 # =========================
 
 def query_sindisp_base(limit_each: int, days: int) -> list[dict[str, str]]:
@@ -493,7 +498,6 @@ def enrich_sindisp_items(items: list[dict[str, str]], sleep_s: float = 0.35) -> 
 
     for it in items:
         enriched = dict(it)
-
         url = canonical_sindisp_url(safe_str(enriched.get("url")), default_leg="19")
         enriched["url"] = url
 
@@ -524,19 +528,8 @@ def enrich_sindisp_items(items: list[dict[str, str]], sleep_s: float = 0.35) -> 
 
 
 def dedupe_sindisp(items: list[dict[str, str]]) -> list[dict[str, str]]:
-    """
-    Preferisce il record più ricco.
-    """
     def score(it: dict[str, str]) -> int:
-        fields = [
-            "tipo",
-            "numero",
-            "proponente",
-            "gruppo",
-            "destinatario",
-            "stato",
-            "url",
-        ]
+        fields = ["tipo", "numero", "proponente", "gruppo", "destinatario", "stato", "url"]
         return sum(1 for f in fields if safe_str(it.get(f)))
 
     best_by_key: dict[tuple[str, str], dict[str, str]] = {}
@@ -546,21 +539,14 @@ def dedupe_sindisp(items: list[dict[str, str]]) -> list[dict[str, str]]:
             safe_str(it.get("tipo")).lower(),
             safe_str(it.get("numero")).lower(),
         )
-        if key not in best_by_key:
-            best_by_key[key] = it
-            continue
-        if score(it) > score(best_by_key[key]):
+        if key not in best_by_key or score(it) > score(best_by_key[key]):
             best_by_key[key] = it
 
     out = list(best_by_key.values())
-
-    def sort_key(it: dict[str, str]) -> tuple[str, str]:
-        return (
-            safe_str(it.get("data_presentazione")),
-            safe_str(it.get("numero")),
-        )
-
-    out.sort(key=sort_key, reverse=True)
+    out.sort(
+        key=lambda it: (safe_str(it.get("data_presentazione")), safe_str(it.get("numero"))),
+        reverse=True,
+    )
     return out
 
 
