@@ -33,6 +33,10 @@ PREFIX dc: <http://purl.org/dc/elements/1.1/>
 
 WARNINGS: list[str] = []
 
+DEBUG_MODE = True
+DEBUG_MAX_ITEMS = 3
+DEBUG_HTML_SNIPPET_LEN = 2500
+
 
 # =========================
 # BASIC UTILS
@@ -71,9 +75,6 @@ def html_to_lines(raw_html: str) -> list[str]:
 
 
 def normalize_dati_url(url: str) -> str:
-    """
-    Porta sempre gli URL dati.senato.it a https.
-    """
     url = safe_str(url)
     if not url:
         return ""
@@ -82,9 +83,6 @@ def normalize_dati_url(url: str) -> str:
 
 
 def lodview_html_url(url: str) -> str:
-    """
-    Converte un URI dati.senato.it nella pagina LodView .html.
-    """
     url = normalize_dati_url(url)
     if not url:
         return ""
@@ -93,6 +91,13 @@ def lodview_html_url(url: str) -> str:
     if url.startswith("https://dati.senato.it/"):
         return url + ".html"
     return url
+
+
+def snippet(s: str, n: int = DEBUG_HTML_SNIPPET_LEN) -> str:
+    s = s or ""
+    s = s.replace("\r", " ").replace("\n", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:n]
 
 
 # =========================
@@ -147,22 +152,6 @@ def sparql_select(query: str, timeout_s: int = 90) -> list[dict[str, str]]:
 # URL HELPERS
 # =========================
 
-def extract_docid_from_showdoc_or_loc(url: str) -> str:
-    url = safe_str(url)
-    if not url:
-        return ""
-    m = re.search(r"[?&]id=(\d+)", url)
-    return m.group(1) if m else ""
-
-
-def extract_leg_from_showdoc_or_loc(url: str) -> str:
-    url = safe_str(url)
-    if not url:
-        return ""
-    m = re.search(r"[?&]leg=(\d+)", url)
-    return m.group(1) if m else ""
-
-
 def build_showdoc_url(docid: str, leg: str = "19") -> str:
     docid = safe_str(docid)
     leg = safe_str(leg) or "19"
@@ -187,7 +176,7 @@ def canonical_ddl_url(raw_url: str, fallback_idfase: str = "") -> str:
 
 
 # =========================
-# PARSERS LODVIEW / SHOW-DOC
+# PARSERS
 # =========================
 
 def parse_sindisp_lodview(raw_html: str, source_url: str) -> dict[str, str]:
@@ -204,7 +193,6 @@ def parse_sindisp_lodview(raw_html: str, source_url: str) -> dict[str, str]:
 
     text = html.unescape(raw_html)
 
-    # URLTesto
     m = re.search(
         r"https?://www\.senato\.it/loc/link\.asp\?tipodoc=sindisp&leg=(\d+)&id=(\d+)",
         text,
@@ -215,7 +203,6 @@ def parse_sindisp_lodview(raw_html: str, source_url: str) -> dict[str, str]:
         out["docid"] = m.group(2)
         out["showdoc_url"] = build_showdoc_url(out["docid"], out["leg"])
 
-    # link iniziativa (http o https)
     m = re.search(
         r'href="(https?://dati\.senato\.it/iniziativa/[^"]+)"',
         text,
@@ -263,7 +250,6 @@ def parse_iniziativa_lodview(raw_html: str) -> dict[str, str]:
 
     text = html.unescape(raw_html)
 
-    # caso migliore: link senatore con nome visibile
     m = re.search(
         r'href="(https?://dati\.senato\.it/senatore/\d+)"[^>]*>\s*([^<]+?)\s*</a>',
         text,
@@ -274,7 +260,6 @@ def parse_iniziativa_lodview(raw_html: str) -> dict[str, str]:
         out["proponente"] = clean_html_text(m.group(2))
         return out
 
-    # fallback: href relativo
     m = re.search(
         r'href="(/senatore/\d+)"[^>]*>\s*([^<]+?)\s*</a>',
         text,
@@ -306,7 +291,6 @@ def parse_senatore_lodview(raw_html: str) -> dict[str, str]:
 
     text = html.unescape(raw_html)
 
-    # assoluto http/https
     m = re.search(
         r'href="(https?://dati\.senato\.it/gruppo/\d+)"[^>]*>\s*([^<]+?)\s*</a>',
         text,
@@ -317,7 +301,6 @@ def parse_senatore_lodview(raw_html: str) -> dict[str, str]:
         out["gruppo"] = clean_html_text(m.group(2))
         return out
 
-    # relativo
     m = re.search(
         r'href="(/gruppo/\d+)"[^>]*>\s*([^<]+?)\s*</a>',
         text,
@@ -539,7 +522,15 @@ def best_public_link(showdoc_url: str, lodview_url: str) -> tuple[str, str]:
     return showdoc_url, lodview_url
 
 
-def enrich_single_sindisp(base_item: dict[str, str]) -> dict[str, str]:
+def debug_append(record: dict[str, str], label: str, value: str) -> None:
+    if not DEBUG_MODE:
+        return
+    existing = safe_str(record.get("debug"))
+    piece = f"{label}: {value}"
+    record["debug"] = existing + ("\n" if existing else "") + piece
+
+
+def enrich_single_sindisp(base_item: dict[str, str], debug_rank: int = 0) -> dict[str, str]:
     out = dict(base_item)
 
     atto_uri = normalize_dati_url(base_item.get("atto"))
@@ -568,6 +559,14 @@ def enrich_single_sindisp(base_item: dict[str, str]) -> dict[str, str]:
     gruppo = ""
     destinatario = ""
     stato = ""
+
+    raw_iniziativa = ""
+    raw_senatore = ""
+    raw_gruppo = ""
+    raw_showdoc = ""
+
+    senatore_url = ""
+    gruppo_url = ""
 
     if iniziativa_url:
         try:
@@ -623,6 +622,25 @@ def enrich_single_sindisp(base_item: dict[str, str]) -> dict[str, str]:
         "lodview_url": lodview_url,
     })
 
+    if DEBUG_MODE and debug_rank < DEBUG_MAX_ITEMS:
+        debug_append(out, "DEBUG numero base", safe_str(base_item.get("numero")))
+        debug_append(out, "DEBUG atto_uri", atto_uri)
+        debug_append(out, "DEBUG lodview_url", lodview_url)
+        debug_append(out, "DEBUG showdoc_url", showdoc_url)
+        debug_append(out, "DEBUG iniziativa_url", iniziativa_url)
+        debug_append(out, "DEBUG senatore_url", senatore_url)
+        debug_append(out, "DEBUG gruppo_url", gruppo_url)
+        debug_append(out, "DEBUG parsed tipo", tipo)
+        debug_append(out, "DEBUG parsed proponente", proponente)
+        debug_append(out, "DEBUG parsed gruppo", gruppo)
+        debug_append(out, "DEBUG parsed destinatario", destinatario)
+        debug_append(out, "DEBUG parsed stato", stato)
+        debug_append(out, "DEBUG lodview snippet", snippet(raw_lodview))
+        debug_append(out, "DEBUG iniziativa snippet", snippet(raw_iniziativa))
+        debug_append(out, "DEBUG senatore snippet", snippet(raw_senatore))
+        debug_append(out, "DEBUG gruppo snippet", snippet(raw_gruppo))
+        debug_append(out, "DEBUG showdoc snippet", snippet(raw_showdoc))
+
     return out
 
 
@@ -672,9 +690,9 @@ def fetch_sindisp_last_days(limit_each: int, days: int) -> list[dict[str, str]]:
         })
 
     out: list[dict[str, str]] = []
-    for it in base_items:
+    for idx, it in enumerate(base_items):
         try:
-            out.append(enrich_single_sindisp(it))
+            out.append(enrich_single_sindisp(it, debug_rank=idx))
             time.sleep(0.35)
         except Exception as e:
             WARNINGS.append(
@@ -694,6 +712,7 @@ def fetch_sindisp_last_days(limit_each: int, days: int) -> list[dict[str, str]]:
                 "url_fallback": "",
                 "showdoc_url": "",
                 "lodview_url": fallback_lodview,
+                "debug": f"ENRICHMENT ERROR: {type(e).__name__}: {e}",
             })
 
     deduped = dedupe_sindisp(out)
