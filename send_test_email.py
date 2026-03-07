@@ -265,7 +265,6 @@ def build_unified_acts(senato_ddls: list[dict], senato_sind: list[dict]) -> list
             "kind": "sindisp",
             "branch": safe_str(it.get("branch") or "Senato"),
             "tipo": safe_str(it.get("tipo")),
-            "titolo": safe_str(it.get("titolo") or it.get("title")),
             "destinatari": safe_str(it.get("destinatario") or it.get("destinatari")),
             "numero": safe_str(it.get("numero")),
             "proponenti": safe_str(it.get("proponente") or it.get("proponenti")),
@@ -300,7 +299,6 @@ def format_sindisp_item(act: dict[str, Any]) -> str:
     lines = [
         "Senato",
         f"Tipo: {act.get('tipo') or '-'}",
-        f"Titolo: {act.get('titolo') or '-'}",
         f"A chi è rivolta: {act.get('destinatari') or '-'}",
         f"Numero: {act.get('numero') or '-'}",
         f"Proponente/i: {act.get('proponenti') or '-'}",
