@@ -723,7 +723,7 @@ def fetch_sindisp_last_days(limit_each: int, days: int) -> list[dict[str, str]]:
 # PUBLIC API
 # =========================
 
-def fetch_senato_last_48h(limit_each: int = 200, days: int = 2) -> tuple[list[dict[str, str]], list[dict[str, str]], list[str]]:
+def fetch_senato_last_48h(limit_each: int = 200, days: int = 7) -> tuple[list[dict[str, str]], list[dict[str, str]], list[str]]:
     WARNINGS.clear()
 
     ddls = query_ddls_last_days(limit_each=limit_each, days=days)
