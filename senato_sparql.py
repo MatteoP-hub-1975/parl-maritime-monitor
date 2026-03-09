@@ -56,7 +56,12 @@ def _get(url: str, **kwargs) -> requests.Response:
     last_exc = None
     for _ in range(3):
         try:
-            resp = SESSION.get(url, timeout=TIMEOUT, **kwargs)
+            resp = SESSION.get(
+                url,
+                timeout=TIMEOUT,
+                headers={"Referer": "https://dati.senato.it/", "Origin": "https://dati.senato.it"},
+                **kwargs
+            )
             resp.raise_for_status()
             return resp
         except Exception as exc:
