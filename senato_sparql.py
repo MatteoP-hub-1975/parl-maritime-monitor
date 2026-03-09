@@ -500,7 +500,7 @@ def _find_links_in_page(url: str, html_text: str) -> List[str]:
             out.append(href)
 
     return out
-    def _candidate_sindisp_pages(days_back: int = 7) -> List[str]:
+def _candidate_sindisp_pages(days_back: int = 7) -> List[str]:
     today = dt.date.today()
     urls = []
 
