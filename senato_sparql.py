@@ -102,7 +102,6 @@ def parse_possible_dt(value: str) -> datetime | None:
         except Exception:
             pass
 
-    # fallback "2026-03-07T00:00:00.000"
     m = re.match(r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})", value)
     if m:
         try:
@@ -140,16 +139,6 @@ def http_get(url: str, timeout_s: int = 30, retries: int = 3, backoff_s: float =
                 time.sleep(backoff_s * attempt)
             else:
                 raise last_err
-
-
-def url_works(url: str, timeout_s: int = 12) -> bool:
-    try:
-        url = normalize_dati_url(url)
-        req = urllib.request.Request(url, headers=DEFAULT_HEADERS, method="GET")
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            return 200 <= getattr(resp, "status", 200) < 400
-    except Exception:
-        return False
 
 
 def sparql_select(query: str, timeout_s: int = 90) -> list[dict[str, str]]:
@@ -197,6 +186,12 @@ def canonical_ddl_url(raw_url: str, fallback_idfase: str = "") -> str:
     return raw_url
 
 
+def choose_primary_sindisp_link(showdoc_url: str, lodview_url: str) -> str:
+    showdoc_url = safe_str(showdoc_url)
+    lodview_url = safe_str(lodview_url)
+    return showdoc_url or lodview_url
+
+
 # =========================
 # PARSERS
 # =========================
@@ -225,19 +220,27 @@ def parse_sindisp_lodview(raw_html: str, source_url: str) -> dict[str, str]:
         out["docid"] = m.group(2)
         out["showdoc_url"] = build_showdoc_url(out["docid"], out["leg"])
 
-    m = re.search(
+    # iniziativa: href o resource
+    patterns = [
         r'href="(https?://dati\.senato\.it/iniziativa/[^"]+)"',
-        text,
-        flags=re.IGNORECASE,
-    )
-    if m:
-        out["iniziativa_url"] = normalize_dati_url(m.group(1))
+        r'href="(/iniziativa/[^"]+)"',
+        r'resource="(https?://dati\.senato\.it/iniziativa/[^"]+)"',
+        r'resource="(/iniziativa/[^"]+)"',
+    ]
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if m:
+            url = m.group(1)
+            if url.startswith("/"):
+                url = "https://dati.senato.it" + url
+            out["iniziativa_url"] = normalize_dati_url(url)
+            break
 
     lines = html_to_lines(raw_html)
 
     for ln in lines:
         if not out["numero"]:
-            m = re.search(r"\b([2345]-\d{5})\b", ln)
+            m = re.search(r"\b([23457]-\d{5})\b", ln)
             if m:
                 out["numero"] = m.group(1)
 
@@ -272,34 +275,43 @@ def parse_iniziativa_lodview(raw_html: str) -> dict[str, str]:
 
     text = html.unescape(raw_html)
 
-    m = re.search(
+    # cerca link o resource al senatore
+    sen_patterns = [
         r'href="(https?://dati\.senato\.it/senatore/\d+)"[^>]*>\s*([^<]+?)\s*</a>',
-        text,
-        flags=re.IGNORECASE,
-    )
-    if m:
-        out["senatore_url"] = normalize_dati_url(m.group(1))
-        out["proponente"] = clean_html_text(m.group(2))
-        return out
-
-    m = re.search(
         r'href="(/senatore/\d+)"[^>]*>\s*([^<]+?)\s*</a>',
-        text,
-        flags=re.IGNORECASE,
-    )
-    if m:
-        out["senatore_url"] = normalize_dati_url("https://dati.senato.it" + m.group(1))
-        out["proponente"] = clean_html_text(m.group(2))
-        return out
+        r'resource="(https?://dati\.senato\.it/senatore/\d+)"',
+        r'resource="(/senatore/\d+)"',
+    ]
+
+    for pat in sen_patterns:
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if not m:
+            continue
+
+        url = m.group(1)
+        if url.startswith("/"):
+            url = "https://dati.senato.it" + url
+        out["senatore_url"] = normalize_dati_url(url)
+
+        if len(m.groups()) >= 2:
+            label = clean_html_text(m.group(2))
+            if label:
+                out["proponente"] = label
+        break
 
     lines = html_to_lines(raw_html)
-    for i, ln in enumerate(lines):
-        low = ln.lower()
-        if "presentatore" in low or "primo firmatario" in low:
-            if i + 1 < len(lines):
-                nxt = lines[i + 1].strip()
-                if nxt and len(nxt) < 200:
-                    out["proponente"] = nxt
+
+    # fallback sul testo vicino a "presentatore" / "primo firmatario"
+    if not out["proponente"]:
+        for i, ln in enumerate(lines):
+            low = ln.lower()
+            if "presentatore" in low or "primo firmatario" in low or "presentata da" in low:
+                for j in range(i + 1, min(i + 4, len(lines))):
+                    nxt = lines[j].strip()
+                    if nxt and len(nxt) < 200 and "http" not in nxt.lower():
+                        out["proponente"] = nxt
+                        break
+                if out["proponente"]:
                     break
 
     return out
@@ -307,31 +319,68 @@ def parse_iniziativa_lodview(raw_html: str) -> dict[str, str]:
 
 def parse_senatore_lodview(raw_html: str) -> dict[str, str]:
     out = {
+        "nome": "",
         "gruppo": "",
         "gruppo_url": "",
     }
 
     text = html.unescape(raw_html)
 
-    m = re.search(
-        r'href="(https?://dati\.senato\.it/gruppo/\d+)"[^>]*>\s*([^<]+?)\s*</a>',
-        text,
-        flags=re.IGNORECASE,
-    )
+    # nome da title
+    m = re.search(r"<title>(.*?)</title>", text, flags=re.IGNORECASE | re.DOTALL)
     if m:
-        out["gruppo_url"] = normalize_dati_url(m.group(1))
-        out["gruppo"] = clean_html_text(m.group(2))
-        return out
+        title = clean_html_text(m.group(1))
+        title = re.sub(r"\s*-\s*dati\.senato\.it\s*$", "", title, flags=re.IGNORECASE).strip()
+        if title:
+            out["nome"] = title
 
-    m = re.search(
+    # gruppo: href o resource
+    grp_patterns = [
+        r'href="(https?://dati\.senato\.it/gruppo/\d+)"[^>]*>\s*([^<]+?)\s*</a>',
         r'href="(/gruppo/\d+)"[^>]*>\s*([^<]+?)\s*</a>',
-        text,
-        flags=re.IGNORECASE,
-    )
-    if m:
-        out["gruppo_url"] = normalize_dati_url("https://dati.senato.it" + m.group(1))
-        out["gruppo"] = clean_html_text(m.group(2))
-        return out
+        r'resource="(https?://dati\.senato\.it/gruppo/\d+)"',
+        r'resource="(/gruppo/\d+)"',
+    ]
+
+    for pat in grp_patterns:
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if not m:
+            continue
+
+        url = m.group(1)
+        if url.startswith("/"):
+            url = "https://dati.senato.it" + url
+        out["gruppo_url"] = normalize_dati_url(url)
+
+        if len(m.groups()) >= 2:
+            label = clean_html_text(m.group(2))
+            if label:
+                out["gruppo"] = label
+        break
+
+    lines = html_to_lines(raw_html)
+
+    # fallback testo "Membro Gruppo ..."
+    if not out["gruppo"]:
+        for ln in lines:
+            m = re.search(r"membro\s+gruppo\s+(.+)", ln, flags=re.IGNORECASE)
+            if m:
+                out["gruppo"] = m.group(1).strip()
+                break
+
+    # altro fallback su riga con "gruppo"
+    if not out["gruppo"]:
+        for ln in lines:
+            low = ln.lower()
+            if "gruppo" in low and len(ln) < 200:
+                if low.startswith("gruppo "):
+                    out["gruppo"] = ln[7:].strip()
+                    break
+                if " gruppo " in low:
+                    part = re.split(r"gruppo", ln, flags=re.IGNORECASE, maxsplit=1)[-1].strip()
+                    if part:
+                        out["gruppo"] = part
+                        break
 
     return out
 
@@ -371,6 +420,7 @@ def parse_showdoc(raw_html: str) -> dict[str, str]:
         "destinatario": "",
         "stato": "",
         "numero": "",
+        "proponente": "",
     }
 
     lines = html_to_lines(raw_html)
@@ -404,6 +454,7 @@ def parse_showdoc(raw_html: str) -> dict[str, str]:
         if " - Al " in ln or " - Ai " in ln or " - Alla " in ln or " - Alle " in ln or " - Al Presidente" in ln:
             parts = [p.strip(" -") for p in ln.split(" - ") if p.strip(" -")]
             if len(parts) >= 2:
+                out["proponente"] = parts[0].strip()
                 out["destinatario"] = parts[1].strip().rstrip(".")
             break
 
@@ -528,30 +579,13 @@ LIMIT {int(limit_each)}
         return []
 
 
-def best_public_link(showdoc_url: str, lodview_url: str) -> tuple[str, str]:
-    showdoc_url = safe_str(showdoc_url)
-    lodview_url = safe_str(lodview_url)
-
-    if showdoc_url and url_works(showdoc_url):
-        return showdoc_url, lodview_url
-
-    if lodview_url and url_works(lodview_url):
-        return lodview_url, showdoc_url
-
-    if lodview_url:
-        return lodview_url, showdoc_url
-    return showdoc_url, lodview_url
-
-
 def enrich_single_sindisp(base_item: dict[str, str]) -> dict[str, str]:
     out = dict(base_item)
 
     atto_uri = normalize_dati_url(base_item.get("atto"))
     lodview_url = lodview_html_url(atto_uri)
 
-    raw_lodview = ""
     parsed_lod = {}
-
     if lodview_url:
         try:
             raw_lodview = http_get(lodview_url, timeout_s=25, retries=3, backoff_s=2.0)
@@ -573,6 +607,9 @@ def enrich_single_sindisp(base_item: dict[str, str]) -> dict[str, str]:
     destinatario = ""
     stato = ""
 
+    senatore_url = ""
+    gruppo_url = ""
+
     if iniziativa_url:
         try:
             raw_iniziativa = http_get(iniziativa_url, timeout_s=25, retries=3, backoff_s=2.0)
@@ -584,6 +621,10 @@ def enrich_single_sindisp(base_item: dict[str, str]) -> dict[str, str]:
                 try:
                     raw_senatore = http_get(senatore_url, timeout_s=25, retries=3, backoff_s=2.0)
                     parsed_senatore = parse_senatore_lodview(raw_senatore)
+
+                    if not proponente:
+                        proponente = safe_str(parsed_senatore.get("nome"))
+
                     gruppo = safe_str(parsed_senatore.get("gruppo"))
                     gruppo_url = lodview_html_url(parsed_senatore.get("gruppo_url"))
 
@@ -603,14 +644,17 @@ def enrich_single_sindisp(base_item: dict[str, str]) -> dict[str, str]:
         try:
             raw_showdoc = http_get(showdoc_url, timeout_s=25, retries=2, backoff_s=2.0)
             parsed_showdoc = parse_showdoc(raw_showdoc)
+
+            if not proponente:
+                proponente = safe_str(parsed_showdoc.get("proponente"))
+
             destinatario = safe_str(parsed_showdoc.get("destinatario"))
             stato = safe_str(parsed_showdoc.get("stato"))
+
             if not numero:
                 numero = safe_str(parsed_showdoc.get("numero"))
         except Exception:
             pass
-
-    link, link_fallback = best_public_link(showdoc_url, lodview_url)
 
     out.update({
         "branch": "Senato",
@@ -621,10 +665,12 @@ def enrich_single_sindisp(base_item: dict[str, str]) -> dict[str, str]:
         "gruppo": gruppo,
         "destinatario": destinatario,
         "stato": stato,
-        "url": link,
-        "url_fallback": link_fallback,
+        "url": choose_primary_sindisp_link(showdoc_url, lodview_url),
         "showdoc_url": showdoc_url,
         "lodview_url": lodview_url,
+        "iniziativa_url": iniziativa_url,
+        "senatore_url": senatore_url,
+        "gruppo_url": gruppo_url,
     })
 
     return out
@@ -640,7 +686,6 @@ def dedupe_sindisp(items: list[dict[str, str]]) -> list[dict[str, str]]:
             "destinatario",
             "stato",
             "url",
-            "url_fallback",
         ]
         return sum(1 for f in fields if safe_str(it.get(f)))
 
@@ -699,9 +744,11 @@ def fetch_sindisp_last_days(limit_each: int, days: int) -> list[dict[str, str]]:
                 "destinatario": "",
                 "stato": "",
                 "url": fallback_lodview,
-                "url_fallback": "",
                 "showdoc_url": "",
                 "lodview_url": fallback_lodview,
+                "iniziativa_url": "",
+                "senatore_url": "",
+                "gruppo_url": "",
             })
 
     deduped = dedupe_sindisp(out)
