@@ -160,8 +160,6 @@ def classify_act(title: str, body_text: str, kb_index: dict[str, set[str]]) -> d
             "sector_relevant": False,
             "reason": "Oggetto chiaramente estraneo al settore",
             "score": total_score,
-            "title_hits": title_hits,
-            "text_hits": text_hits,
         }
 
     if title_score > 0:
@@ -169,8 +167,6 @@ def classify_act(title: str, body_text: str, kb_index: dict[str, set[str]]) -> d
             "sector_relevant": True,
             "reason": "Match KB sul titolo/oggetto",
             "score": total_score,
-            "title_hits": title_hits,
-            "text_hits": text_hits,
         }
 
     if is_borderline_omnibus(title_norm):
@@ -179,15 +175,11 @@ def classify_act(title: str, body_text: str, kb_index: dict[str, set[str]]) -> d
                 "sector_relevant": True,
                 "reason": "Oggetto borderline ma match KB sul testo",
                 "score": total_score,
-                "title_hits": title_hits,
-                "text_hits": text_hits,
             }
         return {
             "sector_relevant": False,
             "reason": "Oggetto borderline senza match KB nel testo",
             "score": total_score,
-            "title_hits": title_hits,
-            "text_hits": text_hits,
         }
 
     if text_score > 0:
@@ -195,16 +187,12 @@ def classify_act(title: str, body_text: str, kb_index: dict[str, set[str]]) -> d
             "sector_relevant": True,
             "reason": "Match KB sul testo",
             "score": total_score,
-            "title_hits": title_hits,
-            "text_hits": text_hits,
         }
 
     return {
         "sector_relevant": False,
         "reason": "Nessun match KB",
         "score": total_score,
-        "title_hits": title_hits,
-        "text_hits": text_hits,
     }
 
 
@@ -242,7 +230,6 @@ def build_unified_acts(senato_ddls: list[dict], senato_sind: list[dict]) -> list
             "stato": safe_str(it.get("stato")),
             "commissione": safe_str(it.get("commissione")),
             "link": safe_str(it.get("url")),
-            "link_fallback": safe_str(it.get("url_fallback")),
             "testo": safe_str(it.get("testo") or it.get("body_text") or ""),
         })
 
@@ -257,7 +244,6 @@ def build_unified_acts(senato_ddls: list[dict], senato_sind: list[dict]) -> list
             "gruppo": safe_str(it.get("gruppo")),
             "stato": safe_str(it.get("stato")),
             "link": safe_str(it.get("url")),
-            "link_fallback": safe_str(it.get("url_fallback")),
             "testo": build_sindisp_search_text(it),
         })
 
@@ -269,35 +255,27 @@ def build_unified_acts(senato_ddls: list[dict], senato_sind: list[dict]) -> list
 # =========================
 
 def format_ddl_item(act: dict[str, Any]) -> str:
-    lines = [
-        "Senato",
-        f"Numero DDL: {act.get('numero') or '-'}",
-        f"Titolo: {act.get('titolo') or '-'}",
-        f"Data presentazione: {act.get('data_presentazione') or '-'}",
-        f"Iniziativa: {act.get('iniziativa') or '-'}",
-        f"Stato: {act.get('stato') or '-'}",
-        f"Commissione: {act.get('commissione') or '-'}",
-        f"Link: {act.get('link') or '-'}",
-    ]
-    if act.get("link_fallback"):
-        lines.append(f"Link fallback: {act.get('link_fallback')}")
-    return "\n".join(lines)
+    return (
+        f"Senato | Numero DDL: {act.get('numero') or '-'} | "
+        f"Titolo: {act.get('titolo') or '-'} | "
+        f"Data presentazione: {act.get('data_presentazione') or '-'} | "
+        f"Iniziativa: {act.get('iniziativa') or '-'} | "
+        f"Stato: {act.get('stato') or '-'} | "
+        f"Commissione: {act.get('commissione') or '-'} | "
+        f"Link: {act.get('link') or '-'}"
+    )
 
 
 def format_sindisp_item(act: dict[str, Any]) -> str:
-    lines = [
-        "Senato",
-        f"Tipo: {act.get('tipo') or '-'}",
-        f"A chi è rivolta: {act.get('destinatari') or '-'}",
-        f"Numero: {act.get('numero') or '-'}",
-        f"Proponente/i: {act.get('proponenti') or '-'}",
-        f"Gruppo parlamentare: {act.get('gruppo') or '-'}",
-        f"Stato: {act.get('stato') or '-'}",
-        f"Link: {act.get('link') or '-'}",
-    ]
-    if act.get("link_fallback"):
-        lines.append(f"Link fallback: {act.get('link_fallback')}")
-    return "\n".join(lines)
+    return (
+        f"Senato | Tipo: {act.get('tipo') or '-'} | "
+        f"Numero: {act.get('numero') or '-'} | "
+        f"A chi è rivolta: {act.get('destinatari') or '-'} | "
+        f"Proponente/i: {act.get('proponenti') or '-'} | "
+        f"Gruppo parlamentare: {act.get('gruppo') or '-'} | "
+        f"Stato: {act.get('stato') or '-'} | "
+        f"Link: {act.get('link') or '-'}"
+    )
 
 
 def format_act_for_email(act: dict[str, Any]) -> str:
@@ -306,13 +284,7 @@ def format_act_for_email(act: dict[str, Any]) -> str:
     if act.get("kind") == "sindisp":
         return format_sindisp_item(act)
 
-    lines = [
-        f"Tipo atto: {act.get('kind') or '-'}",
-        f"Link: {act.get('link') or '-'}",
-    ]
-    if act.get("link_fallback"):
-        lines.append(f"Link fallback: {act.get('link_fallback')}")
-    return "\n".join(lines)
+    return f"Tipo atto: {act.get('kind') or '-'} | Link: {act.get('link') or '-'}"
 
 
 def render_section(title: str, acts: list[dict[str, Any]], empty_text: str) -> str:
@@ -323,11 +295,9 @@ def render_section(title: str, acts: list[dict[str, Any]], empty_text: str) -> s
         return "\n".join(lines)
 
     for idx, act in enumerate(acts, start=1):
-        lines.append(f"[{idx}]")
-        lines.append(format_act_for_email(act))
-        lines.append("")
+        lines.append(f"[{idx}] {format_act_for_email(act)}")
 
-    return "\n".join(lines).rstrip()
+    return "\n".join(lines)
 
 
 def build_email_body(
@@ -392,7 +362,7 @@ def main() -> None:
     senato_sind: list[dict] = []
 
     try:
-        ddls, sind, warn = fetch_senato_last_48h(limit_each=200, days=7)
+        ddls, sind, warn = fetch_senato_last_48h(limit_each=50, days=7)
         senato_ddls = ddls
         senato_sind = sind
         SOURCES_WARNINGS.extend(warn)
