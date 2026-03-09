@@ -99,12 +99,7 @@ def format_line(idx: int, item: Dict[str, str]) -> str:
 def build_report(days_back: int = 7, legislatura: str = "19"):
     kb = load_kb("kb.yaml")
 
-    try:
-        ddl_items = fetch_recent_ddl(days_back=days_back, legislatura=legislatura)
-    except Exception as exc:
-        print(f"DEBUG ERRORE DDL: {exc}")
-        LOG.exception("Errore fetch DDL: %s", exc)
-        ddl_items = []
+      ddl_items = []
 
     try:
         sindisp_items = fetch_recent_sindisp(days_back=days_back, legislatura=legislatura)
