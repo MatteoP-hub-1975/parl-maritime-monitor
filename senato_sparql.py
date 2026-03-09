@@ -65,15 +65,28 @@ def _get(url: str, **kwargs) -> requests.Response:
 
 
 def run_sparql(query: str) -> List[Dict]:
-    resp = _get(
+    payload = {
+        "default-graph-uri": "",
+        "query": f"{PREFIXES}\n{query}",
+        "format": "application/sparql-results+json",
+        "timeout": "0",
+    }
+
+    headers = {
+        "Accept": "application/sparql-results+json, application/json;q=0.9, */*;q=0.8",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Origin": "https://dati.senato.it",
+        "Referer": "https://dati.senato.it/sparql",
+    }
+
+    resp = SESSION.post(
         SPARQL_ENDPOINT,
-        params={
-            "default-graph-uri": "",
-            "query": f"{PREFIXES}\n{query}",
-            "format": "application/sparql-results+json",
-            "timeout": "0",
-        },
+        data=payload,
+        headers=headers,
+        timeout=TIMEOUT,
     )
+    resp.raise_for_status()
+
     payload = resp.json()
     return payload.get("results", {}).get("bindings", [])
 
