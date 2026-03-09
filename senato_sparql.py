@@ -62,6 +62,7 @@ def _get(url: str, **kwargs) -> requests.Response:
                 headers={"Referer": "https://dati.senato.it/", "Origin": "https://dati.senato.it"},
                 **kwargs
             )
+            print(f"DEBUG SPARQL STATUS: {resp.status_code} | LEN: {len(resp.text)} | START: {resp.text[:500]}")
             resp.raise_for_status()
             return resp
         except Exception as exc:
