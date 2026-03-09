@@ -1,421 +1,175 @@
+import logging
 import os
 import re
 import smtplib
-import unicodedata
-from email.message import EmailMessage
 from datetime import datetime
-from zoneinfo import ZoneInfo
-from typing import Any
+from email.message import EmailMessage
+from typing import Any, Dict, List, Tuple
 
 import yaml
 
-from senato_sparql import fetch_senato_last_48h
+from senato_sparql import fetch_recent_ddl, fetch_recent_sindisp
 
-SMTP_HOST = "smtp.gmail.com"
-SMTP_PORT = 587
-
-SOURCES_WARNINGS: list[str] = []
-
-
-# =========================
-# KB + NORMALIZZAZIONE
-# =========================
-
-def load_kb(path: str = "kb.yaml") -> dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+LOG = logging.getLogger(__name__)
 
 
 def normalize_text(text: str) -> str:
-    if not text:
-        return ""
-    text = text.lower()
-    text = unicodedata.normalize("NFD", text)
-    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
-    text = re.sub(r"[^\w\s]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    text = (text or "").lower()
+    text = re.sub(r"[^\w\sàèéìòóù]", " ", text, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", text).strip()
 
 
-def flatten_kb_section(section: Any) -> set[str]:
-    values: set[str] = set()
-
-    def _walk(obj: Any) -> None:
-        if isinstance(obj, str):
-            val = normalize_text(obj)
-            if val:
-                values.add(val)
-        elif isinstance(obj, list):
-            for item in obj:
-                _walk(item)
-        elif isinstance(obj, dict):
-            for v in obj.values():
-                _walk(v)
-
-    _walk(section)
-    return values
+def _collect_lists(node: Any, path: Tuple[str, ...] = ()) -> List[Tuple[Tuple[str, ...], List[str]]]:
+    out: List[Tuple[Tuple[str, ...], List[str]]] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            out.extend(_collect_lists(value, path + (str(key).lower(),)))
+    elif isinstance(node, list):
+        strings = [str(x).strip() for x in node if str(x).strip()]
+        if strings:
+            out.append((path, strings))
+    return out
 
 
-def build_kb_index(kb: dict[str, Any]) -> dict[str, set[str]]:
-    return {
-        "keywords": flatten_kb_section(kb.get("keywords", {})),
-        "keyphrases": flatten_kb_section(kb.get("keyphrases", {})),
-        "norm_refs": flatten_kb_section(kb.get("norm_refs", {})),
-        "entities": flatten_kb_section(kb.get("entities", {})),
-    }
+def load_kb(path: str = "kb.yaml") -> Dict[str, List[str]]:
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+
+    include, exclude = [], []
+    for path_tokens, values in _collect_lists(data):
+        joined = " ".join(path_tokens)
+        if any(k in joined for k in ("exclude", "negative", "non", "irrilev", "not_relevant", "fuori")):
+            exclude.extend(values)
+        elif any(k in joined for k in ("include", "positive", "settore", "maritt", "shipping", "relevant", "rilev")):
+            include.extend(values)
+
+    include = sorted(set(normalize_text(x) for x in include if x))
+    exclude = sorted(set(normalize_text(x) for x in exclude if x))
+    return {"include": include, "exclude": exclude}
 
 
-# =========================
-# CLASSIFICAZIONE
-# =========================
+def classify_item(item: Dict[str, str], kb: Dict[str, List[str]]):
+    haystack = normalize_text(
+        " ".join(
+            [
+                item.get("categoria_atto", ""),
+                item.get("tipo", ""),
+                item.get("numero", ""),
+                item.get("a_chi", ""),
+                item.get("proponenti", ""),
+                item.get("gruppo", ""),
+                item.get("titolo", ""),
+                item.get("testo", ""),
+            ]
+        )
+    )
 
-def find_hits(text_norm: str, terms: set[str]) -> list[str]:
-    if not text_norm:
-        return []
+    include_hits = [kw for kw in kb.get("include", []) if kw and kw in haystack]
+    exclude_hits = [kw for kw in kb.get("exclude", []) if kw and kw in haystack]
 
-    padded = f" {text_norm} "
-    hits: list[str] = []
-
-    for term in terms:
-        if not term:
-            continue
-        needle = f" {term} "
-        if needle in padded:
-            hits.append(term)
-
-    return sorted(set(hits))
-
-
-def is_obviously_non_sector(text_norm: str) -> bool:
-    obvious_non_sector_terms = [
-        "musica",
-        "conservatorio",
-        "bicicletta",
-        "biciclette",
-        "cinema",
-        "beni archeologici",
-        "sport dilettantistico",
-        "spettacolo dal vivo",
-        "universita telematica",
-    ]
-    padded = f" {text_norm} "
-    return any(f" {term} " in padded for term in obvious_non_sector_terms)
+    score = len(include_hits) - len(exclude_hits)
+    if include_hits and not exclude_hits:
+        return True, {"include_hits": include_hits, "exclude_hits": exclude_hits}
+    if exclude_hits and not include_hits:
+        return False, {"include_hits": include_hits, "exclude_hits": exclude_hits}
+    if score > 0:
+        return True, {"include_hits": include_hits, "exclude_hits": exclude_hits}
+    return False, {"include_hits": include_hits, "exclude_hits": exclude_hits}
 
 
-def is_borderline_omnibus(text_norm: str) -> bool:
-    omnibus_terms = [
-        "bilancio",
-        "legge europea",
-        "decreto legge",
-        "milleproroghe",
-        "semplificazioni",
-        "infrastrutture",
-        "concorrenza",
-        "misure urgenti",
-        "disposizioni urgenti",
-        "delega al governo",
-    ]
-    padded = f" {text_norm} "
-    return any(f" {term} " in padded for term in omnibus_terms)
-
-
-def score_hits(title_hits: dict[str, list[str]], text_hits: dict[str, list[str]]) -> int:
-    score = 0
-    score += len(title_hits["keywords"]) * 2
-    score += len(title_hits["keyphrases"]) * 4
-    score += len(title_hits["norm_refs"]) * 4
-    score += len(title_hits["entities"]) * 3
-
-    score += len(text_hits["keywords"]) * 1
-    score += len(text_hits["keyphrases"]) * 2
-    score += len(text_hits["norm_refs"]) * 3
-    score += len(text_hits["entities"]) * 2
-    return score
-
-
-def classify_act(title: str, body_text: str, kb_index: dict[str, set[str]]) -> dict[str, Any]:
-    title_norm = normalize_text(title)
-    body_norm = normalize_text(body_text)
-
-    title_hits = {
-        "keywords": find_hits(title_norm, kb_index["keywords"]),
-        "keyphrases": find_hits(title_norm, kb_index["keyphrases"]),
-        "norm_refs": find_hits(title_norm, kb_index["norm_refs"]),
-        "entities": find_hits(title_norm, kb_index["entities"]),
-    }
-
-    text_hits = {
-        "keywords": find_hits(body_norm, kb_index["keywords"]),
-        "keyphrases": find_hits(body_norm, kb_index["keyphrases"]),
-        "norm_refs": find_hits(body_norm, kb_index["norm_refs"]),
-        "entities": find_hits(body_norm, kb_index["entities"]),
-    }
-
-    title_score = sum(len(v) for v in title_hits.values())
-    text_score = sum(len(v) for v in text_hits.values())
-    total_score = score_hits(title_hits, text_hits)
-
-    if is_obviously_non_sector(title_norm) and title_score == 0:
-        return {
-            "sector_relevant": False,
-            "reason": "Oggetto chiaramente estraneo al settore",
-            "score": total_score,
-        }
-
-    if title_score > 0:
-        return {
-            "sector_relevant": True,
-            "reason": "Match KB sul titolo/oggetto",
-            "score": total_score,
-        }
-
-    if is_borderline_omnibus(title_norm):
-        if text_score > 0:
-            return {
-                "sector_relevant": True,
-                "reason": "Oggetto borderline ma match KB sul testo",
-                "score": total_score,
-            }
-        return {
-            "sector_relevant": False,
-            "reason": "Oggetto borderline senza match KB nel testo",
-            "score": total_score,
-        }
-
-    if text_score > 0:
-        return {
-            "sector_relevant": True,
-            "reason": "Match KB sul testo",
-            "score": total_score,
-        }
-
-    return {
-        "sector_relevant": False,
-        "reason": "Nessun match KB",
-        "score": total_score,
-    }
-
-
-# =========================
-# NORMALIZZAZIONE RECORD
-# =========================
-
-def safe_str(v: Any) -> str:
-    return str(v).strip() if v is not None else ""
-
-
-def build_sindisp_search_text(it: dict[str, Any]) -> str:
+def format_line(idx: int, item: Dict[str, str]) -> str:
     parts = [
-        safe_str(it.get("tipo")),
-        safe_str(it.get("destinatario") or it.get("destinatari")),
-        safe_str(it.get("proponente") or it.get("proponenti")),
-        safe_str(it.get("gruppo")),
-        safe_str(it.get("stato")),
-        safe_str(it.get("numero")),
+        f"[{idx}]",
+        item.get("fonte", "-"),
+        item.get("tipo", "-"),
+        f"Numero: {item.get('numero', '-')}",
+        f"A chi è rivolta: {item.get('a_chi', '-')}",
+        f"Proponente/i: {item.get('proponenti', '-')}",
+        f"Gruppo parlamentare: {item.get('gruppo', '-')}",
+        f"Stato: {item.get('stato', '-')}",
+        f"Link: {item.get('link', '-')}",
     ]
-    return " | ".join([p for p in parts if p])
+    if item.get("categoria_atto") == "DDL":
+        parts.insert(3, f"Titolo: {item.get('titolo', '-')}")
+    return " | ".join(parts)
 
 
-def build_unified_acts(senato_ddls: list[dict], senato_sind: list[dict]) -> list[dict]:
-    acts: list[dict] = []
+def build_report(days_back: int = 7, legislatura: str = "19"):
+    kb = load_kb("kb.yaml")
 
-    for it in senato_ddls:
-        acts.append({
-            "kind": "ddl",
-            "branch": safe_str(it.get("branch") or "Senato"),
-            "numero": safe_str(it.get("ddl_number")),
-            "titolo": safe_str(it.get("title") or it.get("titolo")),
-            "data_presentazione": safe_str(it.get("date_presentazione")),
-            "iniziativa": safe_str(it.get("iniziativa")),
-            "stato": safe_str(it.get("stato")),
-            "commissione": safe_str(it.get("commissione")),
-            "link": safe_str(it.get("url")),
-            "testo": safe_str(it.get("testo") or it.get("body_text") or ""),
-        })
+    ddl_items = fetch_recent_ddl(days_back=days_back, legislatura=legislatura)
+    sindisp_items = fetch_recent_sindisp(days_back=days_back, legislatura=legislatura)
 
-    for it in senato_sind:
-        acts.append({
-            "kind": "sindisp",
-            "branch": safe_str(it.get("branch") or "Senato"),
-            "tipo": safe_str(it.get("tipo")),
-            "destinatari": safe_str(it.get("destinatario") or it.get("destinatari")),
-            "numero": safe_str(it.get("numero")),
-            "proponenti": safe_str(it.get("proponente") or it.get("proponenti")),
-            "gruppo": safe_str(it.get("gruppo")),
-            "stato": safe_str(it.get("stato")),
-            "link": safe_str(it.get("url")),
-            "testo": build_sindisp_search_text(it),
-        })
+    LOG.info("DDL trovati dopo filtro Python: %s", len(ddl_items))
+    LOG.info("Sindisp trovati dopo filtro Python: %s", len(sindisp_items))
 
-    return acts
+    all_items = ddl_items + sindisp_items
 
+    relevant, non_relevant = [], []
+    for item in all_items:
+        is_relevant, debug = classify_item(item, kb)
+        item["debug_include_hits"] = ", ".join(debug["include_hits"]) or "-"
+        item["debug_exclude_hits"] = ", ".join(debug["exclude_hits"]) or "-"
+        (relevant if is_relevant else non_relevant).append(item)
 
-# =========================
-# RENDER EMAIL
-# =========================
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+    subject = f"Monitor Parlamento — Trasporto marittimo ({generated_at})"
 
-def format_ddl_item(act: dict[str, Any]) -> str:
-    return (
-        f"Senato | Numero DDL: {act.get('numero') or '-'} | "
-        f"Titolo: {act.get('titolo') or '-'} | "
-        f"Data presentazione: {act.get('data_presentazione') or '-'} | "
-        f"Iniziativa: {act.get('iniziativa') or '-'} | "
-        f"Stato: {act.get('stato') or '-'} | "
-        f"Commissione: {act.get('commissione') or '-'} | "
-        f"Link: {act.get('link') or '-'}"
-    )
+    lines: List[str] = []
+    lines.append("Monitor Parlamento — Trasporto marittimo")
+    lines.append(f"Generato: {generated_at} (Europe/Rome)")
+    lines.append("")
+    lines.append("Sorgenti / Warning")
+    lines.append("------------------")
+    lines.append(f"- DEBUG DDL trovati dopo filtro Python: {len(ddl_items)}")
+    lines.append(f"- DEBUG Sindisp trovati dopo filtro Python: {len(sindisp_items)}")
+    lines.append("")
+    lines.append("Riguarda il settore")
+    lines.append("-------------------")
+    if relevant:
+        for idx, item in enumerate(relevant, start=1):
+            lines.append(format_line(idx, item))
+    else:
+        lines.append("Nessun atto rilevante trovato.")
+    lines.append("")
+    lines.append("Non riguarda il settore")
+    lines.append("-----------------------")
+    if non_relevant:
+        for idx, item in enumerate(non_relevant, start=1):
+            lines.append(format_line(idx, item))
+    else:
+        lines.append("Nessun atto non rilevante trovato.")
 
-
-def format_sindisp_item(act: dict[str, Any]) -> str:
-    return (
-        f"Senato | Tipo: {act.get('tipo') or '-'} | "
-        f"Numero: {act.get('numero') or '-'} | "
-        f"A chi è rivolta: {act.get('destinatari') or '-'} | "
-        f"Proponente/i: {act.get('proponenti') or '-'} | "
-        f"Gruppo parlamentare: {act.get('gruppo') or '-'} | "
-        f"Stato: {act.get('stato') or '-'} | "
-        f"Link: {act.get('link') or '-'}"
-    )
+    return subject, "\n".join(lines)
 
 
-def format_act_for_email(act: dict[str, Any]) -> str:
-    if act.get("kind") == "ddl":
-        return format_ddl_item(act)
-    if act.get("kind") == "sindisp":
-        return format_sindisp_item(act)
+def send_email(subject: str, body: str) -> None:
+    host = os.environ.get("SMTP_HOST") or os.environ.get("SMTP_SERVER")
+    if not host:
+        raise RuntimeError("Manca SMTP_HOST (o SMTP_SERVER) nelle variabili d'ambiente.")
 
-    return f"Tipo atto: {act.get('kind') or '-'} | Link: {act.get('link') or '-'}"
-
-
-def render_section(title: str, acts: list[dict[str, Any]], empty_text: str) -> str:
-    lines = [title, "-" * len(title)]
-
-    if not acts:
-        lines.append(empty_text)
-        return "\n".join(lines)
-
-    for idx, act in enumerate(acts, start=1):
-        lines.append(f"[{idx}] {format_act_for_email(act)}")
-
-    return "\n".join(lines)
-
-
-def build_email_body(
-    now_rome: str,
-    relevant_acts: list[dict[str, Any]],
-    non_relevant_acts: list[dict[str, Any]],
-) -> str:
-    warnings_block = (
-        "\n".join([f"- {w}" for w in SOURCES_WARNINGS])
-        if SOURCES_WARNINGS
-        else "- Nessun problema rilevato sulle sorgenti."
-    )
-
-    parts = [
-        "Monitor Parlamento — Trasporto marittimo",
-        f"Generato: {now_rome} (Europe/Rome)",
-        "",
-        "Sorgenti / Warning",
-        "------------------",
-        warnings_block,
-        "",
-        render_section(
-            "Riguarda il settore",
-            relevant_acts,
-            "Nessun atto rilevante trovato.",
-        ),
-        "",
-        render_section(
-            "Non riguarda il settore",
-            non_relevant_acts,
-            "Nessun atto non rilevante trovato.",
-        ),
-    ]
-
-    return "\n".join(parts)
-
-
-# =========================
-# MAIN
-# =========================
-
-def main() -> None:
+    port = int(os.environ.get("SMTP_PORT", os.environ.get("SMTP_SERVER_PORT", "587")))
     username = os.environ["SMTP_USERNAME"]
     password = os.environ["SMTP_PASSWORD"]
     to_email = os.environ["ALERT_TO_EMAIL"]
-
-    now_rome = datetime.now(ZoneInfo("Europe/Rome")).strftime("%Y-%m-%d %H:%M")
-
-    try:
-        kb = load_kb("kb.yaml")
-        kb_index = build_kb_index(kb)
-    except Exception as e:
-        SOURCES_WARNINGS.append(f"Errore caricamento kb.yaml: {type(e).__name__}: {e}")
-        kb_index = {
-            "keywords": set(),
-            "keyphrases": set(),
-            "norm_refs": set(),
-            "entities": set(),
-        }
-
-    senato_ddls: list[dict] = []
-    senato_sind: list[dict] = []
-
-    try:
-        ddls, sind, warn = fetch_senato_last_48h(limit_each=50, days=7)
-        senato_ddls = ddls
-        senato_sind = sind
-        SOURCES_WARNINGS.extend(warn)
-    except Exception as e:
-        SOURCES_WARNINGS.append(
-            f"Errore imprevisto durante fetch_senato_last_48h: {type(e).__name__}: {e}"
-        )
-
-    acts = build_unified_acts(senato_ddls, senato_sind)
-
-    relevant_acts: list[dict[str, Any]] = []
-    non_relevant_acts: list[dict[str, Any]] = []
-
-    for act in acts:
-        title_for_classification = safe_str(act.get("titolo")) or safe_str(act.get("testo"))
-        body_for_classification = safe_str(act.get("testo"))
-
-        classification = classify_act(
-            title=title_for_classification,
-            body_text=body_for_classification,
-            kb_index=kb_index,
-        )
-        act["classification"] = classification
-
-        if classification["sector_relevant"]:
-            relevant_acts.append(act)
-        else:
-            non_relevant_acts.append(act)
-
-    body = build_email_body(
-        now_rome=now_rome,
-        relevant_acts=relevant_acts,
-        non_relevant_acts=non_relevant_acts,
-    )
+    from_email = os.environ.get("SMTP_FROM_EMAIL", username)
 
     msg = EmailMessage()
-    msg["Subject"] = f"Monitor Parlamento (marittimo) — {now_rome}"
-    msg["From"] = username
+    msg["Subject"] = subject
+    msg["From"] = from_email
     msg["To"] = to_email
     msg.set_content(body)
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
-        s.ehlo()
-        s.starttls()
-        s.login(username, password)
-        s.send_message(msg)
-
-    print("Email inviata a", to_email)
-    print("DDL:", len(senato_ddls))
-    print("Sindisp:", len(senato_sind))
-    print("Atti rilevanti:", len(relevant_acts))
-    print("Atti non rilevanti:", len(non_relevant_acts))
+    with smtplib.SMTP(host, port, timeout=60) as server:
+        server.starttls()
+        server.login(username, password)
+        server.send_message(msg)
 
 
 if __name__ == "__main__":
-    main()
+    days_back = int(os.environ.get("DAYS_BACK", "7"))
+    legislatura = os.environ.get("LEGISLATURA", "19")
+    subject, body = build_report(days_back=days_back, legislatura=legislatura)
+    print(body)
+    send_email(subject, body)
