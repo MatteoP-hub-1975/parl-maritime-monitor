@@ -392,7 +392,7 @@ def main() -> None:
     senato_sind: list[dict] = []
 
     try:
-        ddls, sind, warn = fetch_senato_last_48h(limit_each=200, days=2)
+        ddls, sind, warn = fetch_senato_last_48h(limit_each=200, days=7)
         senato_ddls = ddls
         senato_sind = sind
         SOURCES_WARNINGS.extend(warn)
