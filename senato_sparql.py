@@ -414,3 +414,158 @@ ORDER BY DESC(?data) DESC(?numero)
             }
         )
     return items
+def _month_name_it(month: int) -> str:
+    mesi = {
+        1: "gennaio",
+        2: "febbraio",
+        3: "marzo",
+        4: "aprile",
+        5: "maggio",
+        6: "giugno",
+        7: "luglio",
+        8: "agosto",
+        9: "settembre",
+        10: "ottobre",
+        11: "novembre",
+        12: "dicembre",
+    }
+    return mesi[month]
+
+
+def _parse_data_italiana(value: str) -> Optional[dt.date]:
+    if not value:
+        return None
+
+    value = _compact_spaces(value).lower()
+
+    m = re.search(r"(\d{1,2})\s+([a-zàèéìòù]+)\s+(\d{4})", value)
+    if not m:
+        return None
+
+    giorno = int(m.group(1))
+    mese_nome = m.group(2)
+    anno = int(m.group(3))
+
+    mesi = {
+        "gennaio": 1,
+        "febbraio": 2,
+        "marzo": 3,
+        "aprile": 4,
+        "maggio": 5,
+        "giugno": 6,
+        "luglio": 7,
+        "agosto": 8,
+        "settembre": 9,
+        "ottobre": 10,
+        "novembre": 11,
+        "dicembre": 12,
+    }
+
+    mese = mesi.get(mese_nome)
+    if not mese:
+        return None
+
+    try:
+        return dt.date(anno, mese, giorno)
+    except ValueError:
+        return None
+
+
+def _extract_text_lines_from_html(html_text: str) -> List[str]:
+    soup = BeautifulSoup(html_text, "html.parser")
+    text = soup.get_text("\n", strip=True)
+    lines = [_compact_spaces(x) for x in text.splitlines()]
+    return [x for x in lines if x]
+
+
+def _fetch_url(url: str) -> str:
+    resp = SESSION.get(
+        url,
+        timeout=TIMEOUT,
+        headers={"User-Agent": USER_AGENT, "Referer": "https://www.senato.it/"},
+    )
+    resp.raise_for_status()
+    return resp.text
+
+
+def _find_links_in_page(url: str, html_text: str) -> List[str]:
+    soup = BeautifulSoup(html_text, "html.parser")
+    out = []
+    seen = set()
+
+    for a in soup.find_all("a", href=True):
+        href = urljoin(url, a["href"])
+        if href not in seen:
+            seen.add(href)
+            out.append(href)
+
+    return out
+    def _candidate_sindisp_pages(days_back: int = 7) -> List[str]:
+    today = dt.date.today()
+    urls = []
+
+    for delta in range(days_back + 2):
+        day = today - dt.timedelta(days=delta)
+        month_name = _month_name_it(day.month)
+        urls.append(
+            f"https://www.senato.it/leg/{day.year}/{month_name}/{day.day:02d}/sindacato-ispettivo"
+        )
+
+    return urls
+    def fetch_recent_sindisp_html(days_back: int = 7, legislatura: Optional[str] = None) -> List[Dict]:
+    items: List[Dict] = []
+    seen = set()
+
+    for page_url in _candidate_sindisp_pages(days_back=days_back):
+        try:
+            html_text = _fetch_url(page_url)
+        except Exception:
+            continue
+
+        links = _find_links_in_page(page_url, html_text)
+
+        for link in links:
+            if "show-doc" not in link and "sindacatoispettivo" not in link.lower():
+                continue
+            if link in seen:
+                continue
+
+            seen.add(link)
+
+            try:
+                enrich = enrich_sindisp_from_page(link)
+            except Exception:
+                continue
+
+            presented_line = enrich.get("presented_line", "")
+            act_date = _parse_data_italiana(presented_line)
+            if not act_date:
+                continue
+
+            min_date = dt.date.today() - dt.timedelta(days=days_back)
+            if act_date < min_date:
+                continue
+
+            page_text = enrich.get("page_text", "")
+            m_num = re.search(r"atto n\.\s*([^\s,;]+)", page_text, flags=re.IGNORECASE)
+
+            items.append(
+                {
+                    "fonte": "Senato",
+                    "categoria_atto": "Sindisp",
+                    "uri": link,
+                    "legislatura": legislatura or "-",
+                    "tipo": "Sindacato ispettivo",
+                    "numero": m_num.group(1) if m_num else "-",
+                    "data_presentazione": act_date.isoformat(),
+                    "stato": enrich.get("status", "-"),
+                    "a_chi": enrich.get("target", "-"),
+                    "proponenti": enrich.get("proponents", "-"),
+                    "gruppo": "-",
+                    "link": enrich.get("public_link") or link,
+                    "testo": page_text,
+                }
+            )
+
+    items.sort(key=lambda x: (x.get("data_presentazione", ""), x.get("numero", "")), reverse=True)
+    return items
