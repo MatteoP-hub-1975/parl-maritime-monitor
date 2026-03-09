@@ -33,10 +33,6 @@ PREFIX dc: <http://purl.org/dc/elements/1.1/>
 
 WARNINGS: list[str] = []
 
-DEBUG_MODE = True
-DEBUG_MAX_ITEMS = 3
-DEBUG_HTML_SNIPPET_LEN = 2500
-
 
 # =========================
 # BASIC UTILS
@@ -46,9 +42,22 @@ def safe_str(v: Any) -> str:
     return str(v).strip() if v is not None else ""
 
 
-def iso_cutoff(days: int) -> str:
-    dt = datetime.now(timezone.utc) - timedelta(days=days)
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+def normalize_dati_url(url: str) -> str:
+    url = safe_str(url)
+    if not url:
+        return ""
+    return re.sub(r"^http://dati\.senato\.it", "https://dati.senato.it", url, flags=re.IGNORECASE)
+
+
+def lodview_html_url(url: str) -> str:
+    url = normalize_dati_url(url)
+    if not url:
+        return ""
+    if url.endswith(".html"):
+        return url
+    if url.startswith("https://dati.senato.it/"):
+        return url + ".html"
+    return url
 
 
 def clean_html_text(s: str) -> str:
@@ -74,30 +83,43 @@ def html_to_lines(raw_html: str) -> list[str]:
     return lines
 
 
-def normalize_dati_url(url: str) -> str:
-    url = safe_str(url)
-    if not url:
-        return ""
-    url = re.sub(r"^http://dati\.senato\.it", "https://dati.senato.it", url, flags=re.IGNORECASE)
-    return url
+def parse_possible_dt(value: str) -> datetime | None:
+    value = safe_str(value)
+    if not value:
+        return None
+
+    candidates = [
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%d",
+        "%d/%m/%Y",
+    ]
+
+    for fmt in candidates:
+        try:
+            dt = datetime.strptime(value, fmt)
+            return dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            pass
+
+    # fallback "2026-03-07T00:00:00.000"
+    m = re.match(r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})", value)
+    if m:
+        try:
+            dt = datetime.strptime(f"{m.group(1)}T{m.group(2)}", "%Y-%m-%dT%H:%M:%S")
+            return dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            pass
+
+    return None
 
 
-def lodview_html_url(url: str) -> str:
-    url = normalize_dati_url(url)
-    if not url:
-        return ""
-    if url.endswith(".html"):
-        return url
-    if url.startswith("https://dati.senato.it/"):
-        return url + ".html"
-    return url
-
-
-def snippet(s: str, n: int = DEBUG_HTML_SNIPPET_LEN) -> str:
-    s = s or ""
-    s = s.replace("\r", " ").replace("\n", " ")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s[:n]
+def is_within_last_days(date_str: str, days: int) -> bool:
+    dt = parse_possible_dt(date_str)
+    if not dt:
+        return False
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    return dt >= cutoff
 
 
 # =========================
@@ -392,9 +414,7 @@ def parse_showdoc(raw_html: str) -> dict[str, str]:
 # DDL
 # =========================
 
-def query_ddls_last_days(limit_each: int, days: int) -> list[dict[str, str]]:
-    cutoff = iso_cutoff(days)
-
+def query_ddls_recent(limit_each: int) -> list[dict[str, str]]:
     query = f"""
 {PREFIXES}
 SELECT DISTINCT
@@ -426,34 +446,15 @@ WHERE {{
     }}
     OPTIONAL {{ ?atto osr:idFase ?idFase . }}
     OPTIONAL {{ ?atto osr:url ?url . }}
-
-    FILTER(BOUND(?dataPresentazione))
-    FILTER(xsd:dateTime(?dataPresentazione) >= xsd:dateTime("{cutoff}"))
 }}
 ORDER BY DESC(?dataPresentazione)
 LIMIT {int(limit_each)}
 """
     try:
-        rows = sparql_select(query)
+        return sparql_select(query)
     except Exception as e:
         WARNINGS.append(f"Query DDL fallita: {type(e).__name__}: {e}")
         return []
-
-    items: list[dict[str, str]] = []
-    for r in rows:
-        idfase = safe_str(r.get("idFase"))
-        items.append({
-            "branch": "Senato",
-            "ddl_number": safe_str(r.get("numero")),
-            "title": safe_str(r.get("titolo")),
-            "date_presentazione": safe_str(r.get("dataPresentazione")),
-            "iniziativa": safe_str(r.get("iniziativaLabel")),
-            "stato": safe_str(r.get("statoLabel")),
-            "commissione": safe_str(r.get("commissioneLabel")),
-            "url": canonical_ddl_url(safe_str(r.get("url")), fallback_idfase=idfase),
-        })
-
-    return dedupe_ddls(items)
 
 
 def dedupe_ddls(items: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -471,13 +472,36 @@ def dedupe_ddls(items: list[dict[str, str]]) -> list[dict[str, str]]:
     return out
 
 
+def fetch_ddls_last_days(limit_each: int, days: int) -> list[dict[str, str]]:
+    rows = query_ddls_recent(limit_each=max(limit_each * 5, 300))
+
+    items: list[dict[str, str]] = []
+    for r in rows:
+        data_presentazione = safe_str(r.get("dataPresentazione"))
+        if not is_within_last_days(data_presentazione, days):
+            continue
+
+        idfase = safe_str(r.get("idFase"))
+        items.append({
+            "branch": "Senato",
+            "ddl_number": safe_str(r.get("numero")),
+            "title": safe_str(r.get("titolo")),
+            "date_presentazione": data_presentazione,
+            "iniziativa": safe_str(r.get("iniziativaLabel")),
+            "stato": safe_str(r.get("statoLabel")),
+            "commissione": safe_str(r.get("commissioneLabel")),
+            "url": canonical_ddl_url(safe_str(r.get("url")), fallback_idfase=idfase),
+        })
+
+    items = dedupe_ddls(items)
+    return items[:limit_each]
+
+
 # =========================
 # SINDISP
 # =========================
 
-def query_sindisp_base(limit_each: int, days: int) -> list[dict[str, str]]:
-    cutoff = iso_cutoff(days)
-
+def query_sindisp_recent(limit_each: int) -> list[dict[str, str]]:
     query = f"""
 {PREFIXES}
 SELECT DISTINCT
@@ -493,9 +517,6 @@ WHERE {{
         ?atto osr:tipo ?tipo .
         ?tipo rdfs:label ?tipoLabel .
     }}
-
-    FILTER(BOUND(?dataPresentazione))
-    FILTER(xsd:dateTime(?dataPresentazione) >= xsd:dateTime("{cutoff}"))
 }}
 ORDER BY DESC(?dataPresentazione)
 LIMIT {int(limit_each)}
@@ -522,15 +543,7 @@ def best_public_link(showdoc_url: str, lodview_url: str) -> tuple[str, str]:
     return showdoc_url, lodview_url
 
 
-def debug_append(record: dict[str, str], label: str, value: str) -> None:
-    if not DEBUG_MODE:
-        return
-    existing = safe_str(record.get("debug"))
-    piece = f"{label}: {value}"
-    record["debug"] = existing + ("\n" if existing else "") + piece
-
-
-def enrich_single_sindisp(base_item: dict[str, str], debug_rank: int = 0) -> dict[str, str]:
+def enrich_single_sindisp(base_item: dict[str, str]) -> dict[str, str]:
     out = dict(base_item)
 
     atto_uri = normalize_dati_url(base_item.get("atto"))
@@ -559,14 +572,6 @@ def enrich_single_sindisp(base_item: dict[str, str], debug_rank: int = 0) -> dic
     gruppo = ""
     destinatario = ""
     stato = ""
-
-    raw_iniziativa = ""
-    raw_senatore = ""
-    raw_gruppo = ""
-    raw_showdoc = ""
-
-    senatore_url = ""
-    gruppo_url = ""
 
     if iniziativa_url:
         try:
@@ -622,25 +627,6 @@ def enrich_single_sindisp(base_item: dict[str, str], debug_rank: int = 0) -> dic
         "lodview_url": lodview_url,
     })
 
-    if DEBUG_MODE and debug_rank < DEBUG_MAX_ITEMS:
-        debug_append(out, "DEBUG numero base", safe_str(base_item.get("numero")))
-        debug_append(out, "DEBUG atto_uri", atto_uri)
-        debug_append(out, "DEBUG lodview_url", lodview_url)
-        debug_append(out, "DEBUG showdoc_url", showdoc_url)
-        debug_append(out, "DEBUG iniziativa_url", iniziativa_url)
-        debug_append(out, "DEBUG senatore_url", senatore_url)
-        debug_append(out, "DEBUG gruppo_url", gruppo_url)
-        debug_append(out, "DEBUG parsed tipo", tipo)
-        debug_append(out, "DEBUG parsed proponente", proponente)
-        debug_append(out, "DEBUG parsed gruppo", gruppo)
-        debug_append(out, "DEBUG parsed destinatario", destinatario)
-        debug_append(out, "DEBUG parsed stato", stato)
-        debug_append(out, "DEBUG lodview snippet", snippet(raw_lodview))
-        debug_append(out, "DEBUG iniziativa snippet", snippet(raw_iniziativa))
-        debug_append(out, "DEBUG senatore snippet", snippet(raw_senatore))
-        debug_append(out, "DEBUG gruppo snippet", snippet(raw_gruppo))
-        debug_append(out, "DEBUG showdoc snippet", snippet(raw_showdoc))
-
     return out
 
 
@@ -677,22 +663,26 @@ def dedupe_sindisp(items: list[dict[str, str]]) -> list[dict[str, str]]:
 
 
 def fetch_sindisp_last_days(limit_each: int, days: int) -> list[dict[str, str]]:
-    rows = query_sindisp_base(limit_each=limit_each, days=days)
+    rows = query_sindisp_recent(limit_each=max(limit_each * 5, 300))
 
     base_items: list[dict[str, str]] = []
     for r in rows:
+        data_presentazione = safe_str(r.get("dataPresentazione"))
+        if not is_within_last_days(data_presentazione, days):
+            continue
+
         base_items.append({
             "atto": normalize_dati_url(safe_str(r.get("atto"))),
             "branch": "Senato",
             "tipo": safe_str(r.get("tipoLabel")),
             "numero": safe_str(r.get("numero")),
-            "data_presentazione": safe_str(r.get("dataPresentazione")),
+            "data_presentazione": data_presentazione,
         })
 
     out: list[dict[str, str]] = []
-    for idx, it in enumerate(base_items):
+    for it in base_items:
         try:
-            out.append(enrich_single_sindisp(it, debug_rank=idx))
+            out.append(enrich_single_sindisp(it))
             time.sleep(0.35)
         except Exception as e:
             WARNINGS.append(
@@ -712,7 +702,6 @@ def fetch_sindisp_last_days(limit_each: int, days: int) -> list[dict[str, str]]:
                 "url_fallback": "",
                 "showdoc_url": "",
                 "lodview_url": fallback_lodview,
-                "debug": f"ENRICHMENT ERROR: {type(e).__name__}: {e}",
             })
 
     deduped = dedupe_sindisp(out)
@@ -723,10 +712,13 @@ def fetch_sindisp_last_days(limit_each: int, days: int) -> list[dict[str, str]]:
 # PUBLIC API
 # =========================
 
-def fetch_senato_last_48h(limit_each: int = 200, days: int = 7) -> tuple[list[dict[str, str]], list[dict[str, str]], list[str]]:
+def fetch_senato_last_48h(limit_each: int = 200, days: int = 2) -> tuple[list[dict[str, str]], list[dict[str, str]], list[str]]:
     WARNINGS.clear()
 
-    ddls = query_ddls_last_days(limit_each=limit_each, days=days)
+    ddls = fetch_ddls_last_days(limit_each=limit_each, days=days)
     sind = fetch_sindisp_last_days(limit_each=limit_each, days=days)
+
+    WARNINGS.append(f"DEBUG DDL trovati dopo filtro Python: {len(ddls)}")
+    WARNINGS.append(f"DEBUG Sindisp trovati dopo filtro Python: {len(sind)}")
 
     return ddls, sind, list(WARNINGS)
