@@ -106,10 +106,16 @@ def build_report(days_back: int = 7, legislatura: str = "19"):
     ddl_items = []
 
     try:
-    sindisp_items = fetch_recent_sindisp(days_back=days_back, legislatura=legislatura)
+        ddl_items = fetch_recent_ddl(days_back=days_back, legislatura=legislatura)
     except Exception as exc:
-    LOG.exception("Errore fetch Sindisp: %s", exc)
-    sindisp_items = []
+        LOG.exception("Errore fetch DDL: %s", exc)
+        ddl_items = []
+
+    try:
+        sindisp_items = fetch_recent_sindisp(days_back=days_back, legislatura=legislatura)
+    except Exception as exc:
+        LOG.exception("Errore fetch Sindisp: %s", exc)
+        sindisp_items = []
     LOG.info("DDL trovati dopo filtro Python: %s", len(ddl_items))
     LOG.info("Sindisp trovati dopo filtro Python: %s", len(sindisp_items))
 
