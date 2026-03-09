@@ -114,7 +114,7 @@ def build_report(days_back: int = 7, legislatura: str = "19"):
         item["debug_exclude_hits"] = ", ".join(debug["exclude_hits"]) or "-"
         (relevant if is_relevant else non_relevant).append(item)
 
-    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M")
+    generated_at = datetime.now(ZoneInfo("Europe/Rome")).strftime("%Y-%m-%d %H:%M")
     subject = f"Monitor Parlamento — Trasporto marittimo ({generated_at})"
 
     lines: List[str] = []
@@ -150,7 +150,8 @@ def send_email(subject: str, body: str) -> None:
     if not host:
         raise RuntimeError("Manca SMTP_HOST (o SMTP_SERVER) nelle variabili d'ambiente.")
 
-    port = int(os.environ.get("SMTP_PORT", os.environ.get("SMTP_SERVER_PORT", "587")))
+    port_raw = os.environ.get("SMTP_PORT") or os.environ.get("SMTP_SERVER_PORT") or "587"
+    port = int(port_raw)
     username = os.environ["SMTP_USERNAME"]
     password = os.environ["SMTP_PASSWORD"]
     to_email = os.environ["ALERT_TO_EMAIL"]
