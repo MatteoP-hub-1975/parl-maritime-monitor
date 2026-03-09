@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 import yaml
 
-from senato_sparql import fetch_recent_ddl, fetch_recent_sindisp
+from senato_sparql import fetch_recent_ddl, fetch_recent_sindisp_html
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 LOG = logging.getLogger(__name__)
