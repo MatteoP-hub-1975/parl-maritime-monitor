@@ -102,7 +102,7 @@ def build_report(days_back: int = 7, legislatura: str = "19"):
     ddl_items = []
 
     try:
-        sindisp_items = fetch_recent_sindisp(days_back=days_back, legislatura=legislatura)
+        sindisp_items = fetch_recent_sindisp_html(days_back=days_back, legislatura=legislatura)
     except Exception as exc:
         print(f"DEBUG ERRORE SINDISP: {exc}")
         LOG.exception("Errore fetch Sindisp: %s", exc)
