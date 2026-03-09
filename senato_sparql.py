@@ -512,7 +512,9 @@ def _candidate_sindisp_pages(days_back: int = 7) -> List[str]:
         )
 
     return urls
-   def fetch_recent_sindisp_html(days_back: int = 7, legislatura: Optional[str] = None) -> List[Dict]:
+
+
+def fetch_recent_sindisp_html(days_back: int = 7, legislatura: Optional[str] = None) -> List[Dict]:
     items: List[Dict] = []
     seen = set()
 
