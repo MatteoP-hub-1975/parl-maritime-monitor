@@ -5,6 +5,7 @@ import smtplib
 from datetime import datetime
 from email.message import EmailMessage
 from typing import Any, Dict, List, Tuple
+from zoneinfo import ZoneInfo
 
 import yaml
 
