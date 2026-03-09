@@ -1,724 +1,451 @@
-import json
+import os
 import re
-import html
-import time
-import urllib.parse
-import urllib.request
-from datetime import datetime, timedelta, timezone
+import smtplib
+import unicodedata
+from email.message import EmailMessage
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Any
 
-SPARQL_ENDPOINT = "https://dati.senato.it/sparql"
+import yaml
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/122.0.0.0 Safari/537.36"
-)
+from senato_sparql import fetch_senato_last_48h
 
-DEFAULT_HEADERS = {
-    "User-Agent": USER_AGENT,
-    "Accept": "application/sparql-results+json, application/json, text/html;q=0.9, */*;q=0.8",
-    "Accept-Language": "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Referer": "https://dati.senato.it/",
-    "Connection": "close",
-}
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = 587
 
-PREFIXES = """
-PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
-PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
-PREFIX osr: <http://dati.senato.it/osr/>
-PREFIX dc: <http://purl.org/dc/elements/1.1/>
-"""
-
-WARNINGS: list[str] = []
+SOURCES_WARNINGS: list[str] = []
 
 
 # =========================
-# BASIC UTILS
+# KB + NORMALIZZAZIONE
+# =========================
+
+def load_kb(path: str = "kb.yaml") -> dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def normalize_text(text: str) -> str:
+    if not text:
+        return ""
+    text = text.lower()
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    text = re.sub(r"[^\w\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def flatten_kb_section(section: Any) -> set[str]:
+    values: set[str] = set()
+
+    def _walk(obj: Any) -> None:
+        if isinstance(obj, str):
+            val = normalize_text(obj)
+            if val:
+                values.add(val)
+        elif isinstance(obj, list):
+            for item in obj:
+                _walk(item)
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                _walk(v)
+
+    _walk(section)
+    return values
+
+
+def build_kb_index(kb: dict[str, Any]) -> dict[str, set[str]]:
+    return {
+        "keywords": flatten_kb_section(kb.get("keywords", {})),
+        "keyphrases": flatten_kb_section(kb.get("keyphrases", {})),
+        "norm_refs": flatten_kb_section(kb.get("norm_refs", {})),
+        "entities": flatten_kb_section(kb.get("entities", {})),
+    }
+
+
+# =========================
+# CLASSIFICAZIONE
+# =========================
+
+def find_hits(text_norm: str, terms: set[str]) -> list[str]:
+    if not text_norm:
+        return []
+
+    padded = f" {text_norm} "
+    hits: list[str] = []
+
+    for term in terms:
+        if not term:
+            continue
+        needle = f" {term} "
+        if needle in padded:
+            hits.append(term)
+
+    return sorted(set(hits))
+
+
+def is_obviously_non_sector(text_norm: str) -> bool:
+    obvious_non_sector_terms = [
+        "musica",
+        "conservatorio",
+        "bicicletta",
+        "biciclette",
+        "cinema",
+        "beni archeologici",
+        "sport dilettantistico",
+        "spettacolo dal vivo",
+        "universita telematica",
+    ]
+    padded = f" {text_norm} "
+    return any(f" {term} " in padded for term in obvious_non_sector_terms)
+
+
+def is_borderline_omnibus(text_norm: str) -> bool:
+    omnibus_terms = [
+        "bilancio",
+        "legge europea",
+        "decreto legge",
+        "milleproroghe",
+        "semplificazioni",
+        "infrastrutture",
+        "concorrenza",
+        "misure urgenti",
+        "disposizioni urgenti",
+        "delega al governo",
+    ]
+    padded = f" {text_norm} "
+    return any(f" {term} " in padded for term in omnibus_terms)
+
+
+def score_hits(title_hits: dict[str, list[str]], text_hits: dict[str, list[str]]) -> int:
+    score = 0
+    score += len(title_hits["keywords"]) * 2
+    score += len(title_hits["keyphrases"]) * 4
+    score += len(title_hits["norm_refs"]) * 4
+    score += len(title_hits["entities"]) * 3
+
+    score += len(text_hits["keywords"]) * 1
+    score += len(text_hits["keyphrases"]) * 2
+    score += len(text_hits["norm_refs"]) * 3
+    score += len(text_hits["entities"]) * 2
+    return score
+
+
+def classify_act(title: str, body_text: str, kb_index: dict[str, set[str]]) -> dict[str, Any]:
+    title_norm = normalize_text(title)
+    body_norm = normalize_text(body_text)
+
+    title_hits = {
+        "keywords": find_hits(title_norm, kb_index["keywords"]),
+        "keyphrases": find_hits(title_norm, kb_index["keyphrases"]),
+        "norm_refs": find_hits(title_norm, kb_index["norm_refs"]),
+        "entities": find_hits(title_norm, kb_index["entities"]),
+    }
+
+    text_hits = {
+        "keywords": find_hits(body_norm, kb_index["keywords"]),
+        "keyphrases": find_hits(body_norm, kb_index["keyphrases"]),
+        "norm_refs": find_hits(body_norm, kb_index["norm_refs"]),
+        "entities": find_hits(body_norm, kb_index["entities"]),
+    }
+
+    title_score = sum(len(v) for v in title_hits.values())
+    text_score = sum(len(v) for v in text_hits.values())
+    total_score = score_hits(title_hits, text_hits)
+
+    if is_obviously_non_sector(title_norm) and title_score == 0:
+        return {
+            "sector_relevant": False,
+            "reason": "Oggetto chiaramente estraneo al settore",
+            "score": total_score,
+            "title_hits": title_hits,
+            "text_hits": text_hits,
+        }
+
+    if title_score > 0:
+        return {
+            "sector_relevant": True,
+            "reason": "Match KB sul titolo/oggetto",
+            "score": total_score,
+            "title_hits": title_hits,
+            "text_hits": text_hits,
+        }
+
+    if is_borderline_omnibus(title_norm):
+        if text_score > 0:
+            return {
+                "sector_relevant": True,
+                "reason": "Oggetto borderline ma match KB sul testo",
+                "score": total_score,
+                "title_hits": title_hits,
+                "text_hits": text_hits,
+            }
+        return {
+            "sector_relevant": False,
+            "reason": "Oggetto borderline senza match KB nel testo",
+            "score": total_score,
+            "title_hits": title_hits,
+            "text_hits": text_hits,
+        }
+
+    if text_score > 0:
+        return {
+            "sector_relevant": True,
+            "reason": "Match KB sul testo",
+            "score": total_score,
+            "title_hits": title_hits,
+            "text_hits": text_hits,
+        }
+
+    return {
+        "sector_relevant": False,
+        "reason": "Nessun match KB",
+        "score": total_score,
+        "title_hits": title_hits,
+        "text_hits": text_hits,
+    }
+
+
+# =========================
+# NORMALIZZAZIONE RECORD
 # =========================
 
 def safe_str(v: Any) -> str:
     return str(v).strip() if v is not None else ""
 
 
-def normalize_dati_url(url: str) -> str:
-    url = safe_str(url)
-    if not url:
-        return ""
-    return re.sub(r"^http://dati\.senato\.it", "https://dati.senato.it", url, flags=re.IGNORECASE)
+def build_sindisp_search_text(it: dict[str, Any]) -> str:
+    parts = [
+        safe_str(it.get("tipo")),
+        safe_str(it.get("destinatario") or it.get("destinatari")),
+        safe_str(it.get("proponente") or it.get("proponenti")),
+        safe_str(it.get("gruppo")),
+        safe_str(it.get("stato")),
+        safe_str(it.get("numero")),
+    ]
+    return " | ".join([p for p in parts if p])
 
 
-def lodview_html_url(url: str) -> str:
-    url = normalize_dati_url(url)
-    if not url:
-        return ""
-    if url.endswith(".html"):
-        return url
-    if url.startswith("https://dati.senato.it/"):
-        return url + ".html"
-    return url
+def build_unified_acts(senato_ddls: list[dict], senato_sind: list[dict]) -> list[dict]:
+    acts: list[dict] = []
+
+    for it in senato_ddls:
+        acts.append({
+            "kind": "ddl",
+            "branch": safe_str(it.get("branch") or "Senato"),
+            "numero": safe_str(it.get("ddl_number")),
+            "titolo": safe_str(it.get("title") or it.get("titolo")),
+            "data_presentazione": safe_str(it.get("date_presentazione")),
+            "iniziativa": safe_str(it.get("iniziativa")),
+            "stato": safe_str(it.get("stato")),
+            "commissione": safe_str(it.get("commissione")),
+            "link": safe_str(it.get("url")),
+            "link_fallback": safe_str(it.get("url_fallback")),
+            "testo": safe_str(it.get("testo") or it.get("body_text") or ""),
+        })
+
+    for it in senato_sind:
+        acts.append({
+            "kind": "sindisp",
+            "branch": safe_str(it.get("branch") or "Senato"),
+            "tipo": safe_str(it.get("tipo")),
+            "destinatari": safe_str(it.get("destinatario") or it.get("destinatari")),
+            "numero": safe_str(it.get("numero")),
+            "proponenti": safe_str(it.get("proponente") or it.get("proponenti")),
+            "gruppo": safe_str(it.get("gruppo")),
+            "stato": safe_str(it.get("stato")),
+            "link": safe_str(it.get("url")),
+            "link_fallback": safe_str(it.get("url_fallback")),
+            "testo": build_sindisp_search_text(it),
+        })
+
+    return acts
 
 
-def clean_html_text(s: str) -> str:
-    s = html.unescape(s or "")
-    s = re.sub(r"<[^>]+>", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+# =========================
+# RENDER EMAIL
+# =========================
+
+def format_ddl_item(act: dict[str, Any]) -> str:
+    lines = [
+        "Senato",
+        f"Numero DDL: {act.get('numero') or '-'}",
+        f"Titolo: {act.get('titolo') or '-'}",
+        f"Data presentazione: {act.get('data_presentazione') or '-'}",
+        f"Iniziativa: {act.get('iniziativa') or '-'}",
+        f"Stato: {act.get('stato') or '-'}",
+        f"Commissione: {act.get('commissione') or '-'}",
+        f"Link: {act.get('link') or '-'}",
+    ]
+    if act.get("link_fallback"):
+        lines.append(f"Link fallback: {act.get('link_fallback')}")
+    return "\n".join(lines)
 
 
-def html_to_lines(raw_html: str) -> list[str]:
-    s = raw_html
-    s = re.sub(r"(?is)<script.*?</script>", " ", s)
-    s = re.sub(r"(?is)<style.*?</style>", " ", s)
-    s = re.sub(r"(?i)</(p|div|h1|h2|h3|li|tr|td|section|article|br|span|a|title)>", "\n", s)
-    s = re.sub(r"(?s)<[^>]+>", " ", s)
-    s = html.unescape(s)
+def format_sindisp_item(act: dict[str, Any]) -> str:
+    lines = [
+        "Senato",
+        f"Tipo: {act.get('tipo') or '-'}",
+        f"A chi è rivolta: {act.get('destinatari') or '-'}",
+        f"Numero: {act.get('numero') or '-'}",
+        f"Proponente/i: {act.get('proponenti') or '-'}",
+        f"Gruppo parlamentare: {act.get('gruppo') or '-'}",
+        f"Stato: {act.get('stato') or '-'}",
+        f"Link: {act.get('link') or '-'}",
+    ]
+    if act.get("link_fallback"):
+        lines.append(f"Link fallback: {act.get('link_fallback')}")
+    return "\n".join(lines)
 
-    lines = []
-    for line in s.splitlines():
-        line = re.sub(r"\s+", " ", line).strip()
-        if line:
-            lines.append(line)
-    return lines
+
+def format_act_for_email(act: dict[str, Any]) -> str:
+    if act.get("kind") == "ddl":
+        return format_ddl_item(act)
+    if act.get("kind") == "sindisp":
+        return format_sindisp_item(act)
+
+    lines = [
+        f"Tipo atto: {act.get('kind') or '-'}",
+        f"Link: {act.get('link') or '-'}",
+    ]
+    if act.get("link_fallback"):
+        lines.append(f"Link fallback: {act.get('link_fallback')}")
+    return "\n".join(lines)
 
 
-def parse_possible_dt(value: str) -> datetime | None:
-    value = safe_str(value)
-    if not value:
-        return None
+def render_section(title: str, acts: list[dict[str, Any]], empty_text: str) -> str:
+    lines = [title, "-" * len(title)]
 
-    candidates = [
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%dT%H:%M:%SZ",
-        "%Y-%m-%d",
-        "%d/%m/%Y",
+    if not acts:
+        lines.append(empty_text)
+        return "\n".join(lines)
+
+    for idx, act in enumerate(acts, start=1):
+        lines.append(f"[{idx}]")
+        lines.append(format_act_for_email(act))
+        lines.append("")
+
+    return "\n".join(lines).rstrip()
+
+
+def build_email_body(
+    now_rome: str,
+    relevant_acts: list[dict[str, Any]],
+    non_relevant_acts: list[dict[str, Any]],
+) -> str:
+    warnings_block = (
+        "\n".join([f"- {w}" for w in SOURCES_WARNINGS])
+        if SOURCES_WARNINGS
+        else "- Nessun problema rilevato sulle sorgenti."
+    )
+
+    parts = [
+        "Monitor Parlamento — Trasporto marittimo",
+        f"Generato: {now_rome} (Europe/Rome)",
+        "",
+        "Sorgenti / Warning",
+        "------------------",
+        warnings_block,
+        "",
+        render_section(
+            "Riguarda il settore",
+            relevant_acts,
+            "Nessun atto rilevante trovato.",
+        ),
+        "",
+        render_section(
+            "Non riguarda il settore",
+            non_relevant_acts,
+            "Nessun atto non rilevante trovato.",
+        ),
     ]
 
-    for fmt in candidates:
-        try:
-            dt = datetime.strptime(value, fmt)
-            return dt.replace(tzinfo=timezone.utc)
-        except Exception:
-            pass
-
-    # fallback "2026-03-07T00:00:00.000"
-    m = re.match(r"^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})", value)
-    if m:
-        try:
-            dt = datetime.strptime(f"{m.group(1)}T{m.group(2)}", "%Y-%m-%dT%H:%M:%S")
-            return dt.replace(tzinfo=timezone.utc)
-        except Exception:
-            pass
-
-    return None
-
-
-def is_within_last_days(date_str: str, days: int) -> bool:
-    dt = parse_possible_dt(date_str)
-    if not dt:
-        return False
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    return dt >= cutoff
+    return "\n".join(parts)
 
 
 # =========================
-# HTTP / SPARQL
+# MAIN
 # =========================
 
-def http_get(url: str, timeout_s: int = 30, retries: int = 3, backoff_s: float = 2.0) -> str:
-    url = normalize_dati_url(url)
-    last_err = None
-    for attempt in range(1, retries + 1):
-        try:
-            req = urllib.request.Request(url, headers=DEFAULT_HEADERS, method="GET")
-            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-                return resp.read().decode("utf-8", errors="replace")
-        except Exception as e:
-            last_err = e
-            if attempt < retries:
-                time.sleep(backoff_s * attempt)
-            else:
-                raise last_err
+def main() -> None:
+    username = os.environ["SMTP_USERNAME"]
+    password = os.environ["SMTP_PASSWORD"]
+    to_email = os.environ["ALERT_TO_EMAIL"]
 
+    now_rome = datetime.now(ZoneInfo("Europe/Rome")).strftime("%Y-%m-%d %H:%M")
 
-def url_works(url: str, timeout_s: int = 12) -> bool:
     try:
-        url = normalize_dati_url(url)
-        req = urllib.request.Request(url, headers=DEFAULT_HEADERS, method="GET")
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            return 200 <= getattr(resp, "status", 200) < 400
-    except Exception:
-        return False
-
-
-def sparql_select(query: str, timeout_s: int = 90) -> list[dict[str, str]]:
-    params = urllib.parse.urlencode({
-        "query": query,
-        "format": "application/sparql-results+json",
-    })
-    url = f"{SPARQL_ENDPOINT}?{params}"
-    raw = http_get(url, timeout_s=timeout_s, retries=3, backoff_s=3.0)
-    payload = json.loads(raw)
-
-    rows: list[dict[str, str]] = []
-    for b in payload.get("results", {}).get("bindings", []):
-        row: dict[str, str] = {}
-        for k, v in b.items():
-            row[k] = v.get("value", "")
-        rows.append(row)
-    return rows
-
-
-# =========================
-# URL HELPERS
-# =========================
-
-def build_showdoc_url(docid: str, leg: str = "19") -> str:
-    docid = safe_str(docid)
-    leg = safe_str(leg) or "19"
-    if not docid:
-        return ""
-    return f"https://www.senato.it/show-doc?id={docid}&leg={leg}&tipodoc=Sindisp"
-
-
-def canonical_ddl_url(raw_url: str, fallback_idfase: str = "") -> str:
-    raw_url = safe_str(raw_url)
-    if "scheda-ddl?did=" in raw_url:
-        return raw_url
-
-    m = re.search(r"[?&]did=(\d+)", raw_url)
-    if m:
-        return f"https://www.senato.it/leggi-e-documenti/disegni-di-legge/scheda-ddl?did={m.group(1)}"
-
-    if fallback_idfase:
-        return f"https://www.senato.it/leggi-e-documenti/disegni-di-legge/scheda-ddl?did={fallback_idfase}"
-
-    return raw_url
-
-
-# =========================
-# PARSERS
-# =========================
-
-def parse_sindisp_lodview(raw_html: str, source_url: str) -> dict[str, str]:
-    out = {
-        "lodview_url": safe_str(source_url),
-        "showdoc_url": "",
-        "docid": "",
-        "leg": "19",
-        "iniziativa_url": "",
-        "tipo": "",
-        "numero": "",
-        "data_presentazione": "",
-    }
-
-    text = html.unescape(raw_html)
-
-    m = re.search(
-        r"https?://www\.senato\.it/loc/link\.asp\?tipodoc=sindisp&leg=(\d+)&id=(\d+)",
-        text,
-        flags=re.IGNORECASE,
-    )
-    if m:
-        out["leg"] = m.group(1)
-        out["docid"] = m.group(2)
-        out["showdoc_url"] = build_showdoc_url(out["docid"], out["leg"])
-
-    m = re.search(
-        r'href="(https?://dati\.senato\.it/iniziativa/[^"]+)"',
-        text,
-        flags=re.IGNORECASE,
-    )
-    if m:
-        out["iniziativa_url"] = normalize_dati_url(m.group(1))
-
-    lines = html_to_lines(raw_html)
-
-    for ln in lines:
-        if not out["numero"]:
-            m = re.search(r"\b([2345]-\d{5})\b", ln)
-            if m:
-                out["numero"] = m.group(1)
-
-        if not out["data_presentazione"]:
-            m = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", ln)
-            if m:
-                out["data_presentazione"] = m.group(1)
-
-        if not out["tipo"]:
-            lower_ln = ln.lower()
-            if "interrogazione con richiesta di risposta scritta" in lower_ln:
-                out["tipo"] = "Interrogazione con richiesta di risposta scritta"
-            elif "interrogazione a risposta scritta" in lower_ln:
-                out["tipo"] = "Interrogazione a risposta scritta"
-            elif "interrogazione" in lower_ln:
-                out["tipo"] = "Interrogazione"
-            elif "interpellanza" in lower_ln:
-                out["tipo"] = "Interpellanza"
-            elif "mozione" in lower_ln:
-                out["tipo"] = "Mozione"
-            elif "risoluzione" in lower_ln:
-                out["tipo"] = "Risoluzione"
-
-    return out
-
-
-def parse_iniziativa_lodview(raw_html: str) -> dict[str, str]:
-    out = {
-        "proponente": "",
-        "senatore_url": "",
-    }
-
-    text = html.unescape(raw_html)
-
-    m = re.search(
-        r'href="(https?://dati\.senato\.it/senatore/\d+)"[^>]*>\s*([^<]+?)\s*</a>',
-        text,
-        flags=re.IGNORECASE,
-    )
-    if m:
-        out["senatore_url"] = normalize_dati_url(m.group(1))
-        out["proponente"] = clean_html_text(m.group(2))
-        return out
-
-    m = re.search(
-        r'href="(/senatore/\d+)"[^>]*>\s*([^<]+?)\s*</a>',
-        text,
-        flags=re.IGNORECASE,
-    )
-    if m:
-        out["senatore_url"] = normalize_dati_url("https://dati.senato.it" + m.group(1))
-        out["proponente"] = clean_html_text(m.group(2))
-        return out
-
-    lines = html_to_lines(raw_html)
-    for i, ln in enumerate(lines):
-        low = ln.lower()
-        if "presentatore" in low or "primo firmatario" in low:
-            if i + 1 < len(lines):
-                nxt = lines[i + 1].strip()
-                if nxt and len(nxt) < 200:
-                    out["proponente"] = nxt
-                    break
-
-    return out
-
-
-def parse_senatore_lodview(raw_html: str) -> dict[str, str]:
-    out = {
-        "gruppo": "",
-        "gruppo_url": "",
-    }
-
-    text = html.unescape(raw_html)
-
-    m = re.search(
-        r'href="(https?://dati\.senato\.it/gruppo/\d+)"[^>]*>\s*([^<]+?)\s*</a>',
-        text,
-        flags=re.IGNORECASE,
-    )
-    if m:
-        out["gruppo_url"] = normalize_dati_url(m.group(1))
-        out["gruppo"] = clean_html_text(m.group(2))
-        return out
-
-    m = re.search(
-        r'href="(/gruppo/\d+)"[^>]*>\s*([^<]+?)\s*</a>',
-        text,
-        flags=re.IGNORECASE,
-    )
-    if m:
-        out["gruppo_url"] = normalize_dati_url("https://dati.senato.it" + m.group(1))
-        out["gruppo"] = clean_html_text(m.group(2))
-        return out
-
-    return out
-
-
-def parse_gruppo_lodview(raw_html: str) -> dict[str, str]:
-    out = {"gruppo": ""}
-
-    text = html.unescape(raw_html)
-
-    m = re.search(r"<title>(.*?)</title>", text, flags=re.IGNORECASE | re.DOTALL)
-    if m:
-        title = clean_html_text(m.group(1))
-        title = re.sub(r"\s*-\s*dati\.senato\.it\s*$", "", title, flags=re.IGNORECASE).strip()
-        if title:
-            out["gruppo"] = title
-            return out
-
-    lines = html_to_lines(raw_html)
-    for ln in lines:
-        clean = ln.strip()
-        if not clean:
-            continue
-        if len(clean) < 3:
-            continue
-        if clean.lower().startswith("http"):
-            continue
-        if "dati.senato.it" in clean.lower():
-            continue
-        out["gruppo"] = clean
-        break
-
-    return out
-
-
-def parse_showdoc(raw_html: str) -> dict[str, str]:
-    out = {
-        "destinatario": "",
-        "stato": "",
-        "numero": "",
-    }
-
-    lines = html_to_lines(raw_html)
-
-    for ln in lines:
-        m = re.search(r"\bAtto n\.\s*([0-9\-\/]+)", ln, re.IGNORECASE)
-        if m:
-            out["numero"] = m.group(1).strip()
-            break
-
-    status_prefixes = (
-        "Svolto",
-        "Svolto question time",
-        "Trasformato",
-        "Assegnato",
-        "Concluso",
-        "In corso",
-        "Illustrato",
-        "Ritirato",
-        "Decaduto",
-        "Risposta",
-        "Discussa",
-        "Pubblicato",
-    )
-    for ln in lines:
-        if ln.startswith(status_prefixes):
-            out["stato"] = ln
-            break
-
-    for ln in lines:
-        if " - Al " in ln or " - Ai " in ln or " - Alla " in ln or " - Alle " in ln or " - Al Presidente" in ln:
-            parts = [p.strip(" -") for p in ln.split(" - ") if p.strip(" -")]
-            if len(parts) >= 2:
-                out["destinatario"] = parts[1].strip().rstrip(".")
-            break
-
-    return out
-
-
-# =========================
-# DDL
-# =========================
-
-def query_ddls_recent(limit_each: int) -> list[dict[str, str]]:
-    query = f"""
-{PREFIXES}
-SELECT DISTINCT
-    ?atto
-    ?numero
-    ?titolo
-    ?dataPresentazione
-    ?iniziativaLabel
-    ?statoLabel
-    ?commissioneLabel
-    ?idFase
-    ?url
-WHERE {{
-    ?atto rdf:type osr:DDL .
-    OPTIONAL {{ ?atto dc:title ?titolo . }}
-    OPTIONAL {{ ?atto osr:numero ?numero . }}
-    OPTIONAL {{ ?atto osr:dataPresentazione ?dataPresentazione . }}
-    OPTIONAL {{
-        ?atto osr:stato ?stato .
-        ?stato rdfs:label ?statoLabel .
-    }}
-    OPTIONAL {{
-        ?atto osr:commissione ?commissione .
-        ?commissione rdfs:label ?commissioneLabel .
-    }}
-    OPTIONAL {{
-        ?atto osr:iniziativa ?iniziativa .
-        ?iniziativa rdfs:label ?iniziativaLabel .
-    }}
-    OPTIONAL {{ ?atto osr:idFase ?idFase . }}
-    OPTIONAL {{ ?atto osr:url ?url . }}
-}}
-ORDER BY DESC(?dataPresentazione)
-LIMIT {int(limit_each)}
-"""
-    try:
-        return sparql_select(query)
+        kb = load_kb("kb.yaml")
+        kb_index = build_kb_index(kb)
     except Exception as e:
-        WARNINGS.append(f"Query DDL fallita: {type(e).__name__}: {e}")
-        return []
+        SOURCES_WARNINGS.append(f"Errore caricamento kb.yaml: {type(e).__name__}: {e}")
+        kb_index = {
+            "keywords": set(),
+            "keyphrases": set(),
+            "norm_refs": set(),
+            "entities": set(),
+        }
 
+    senato_ddls: list[dict] = []
+    senato_sind: list[dict] = []
 
-def dedupe_ddls(items: list[dict[str, str]]) -> list[dict[str, str]]:
-    seen = set()
-    out = []
-    for it in items:
-        key = (
-            safe_str(it.get("ddl_number")).lower(),
-            safe_str(it.get("url")).lower(),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(it)
-    return out
-
-
-def fetch_ddls_last_days(limit_each: int, days: int) -> list[dict[str, str]]:
-    rows = query_ddls_recent(limit_each=max(limit_each * 5, 300))
-
-    items: list[dict[str, str]] = []
-    for r in rows:
-        data_presentazione = safe_str(r.get("dataPresentazione"))
-        if not is_within_last_days(data_presentazione, days):
-            continue
-
-        idfase = safe_str(r.get("idFase"))
-        items.append({
-            "branch": "Senato",
-            "ddl_number": safe_str(r.get("numero")),
-            "title": safe_str(r.get("titolo")),
-            "date_presentazione": data_presentazione,
-            "iniziativa": safe_str(r.get("iniziativaLabel")),
-            "stato": safe_str(r.get("statoLabel")),
-            "commissione": safe_str(r.get("commissioneLabel")),
-            "url": canonical_ddl_url(safe_str(r.get("url")), fallback_idfase=idfase),
-        })
-
-    items = dedupe_ddls(items)
-    return items[:limit_each]
-
-
-# =========================
-# SINDISP
-# =========================
-
-def query_sindisp_recent(limit_each: int) -> list[dict[str, str]]:
-    query = f"""
-{PREFIXES}
-SELECT DISTINCT
-    ?atto
-    ?numero
-    ?tipoLabel
-    ?dataPresentazione
-WHERE {{
-    ?atto rdf:type osr:SindacatoIspettivo .
-    OPTIONAL {{ ?atto osr:numero ?numero . }}
-    OPTIONAL {{ ?atto osr:dataPresentazione ?dataPresentazione . }}
-    OPTIONAL {{
-        ?atto osr:tipo ?tipo .
-        ?tipo rdfs:label ?tipoLabel .
-    }}
-}}
-ORDER BY DESC(?dataPresentazione)
-LIMIT {int(limit_each)}
-"""
     try:
-        return sparql_select(query)
+        ddls, sind, warn = fetch_senato_last_48h(limit_each=200, days=2)
+        senato_ddls = ddls
+        senato_sind = sind
+        SOURCES_WARNINGS.extend(warn)
     except Exception as e:
-        WARNINGS.append(f"Query Sindisp base fallita: {type(e).__name__}: {e}")
-        return []
-
-
-def best_public_link(showdoc_url: str, lodview_url: str) -> tuple[str, str]:
-    showdoc_url = safe_str(showdoc_url)
-    lodview_url = safe_str(lodview_url)
-
-    if showdoc_url and url_works(showdoc_url):
-        return showdoc_url, lodview_url
-
-    if lodview_url and url_works(lodview_url):
-        return lodview_url, showdoc_url
-
-    if lodview_url:
-        return lodview_url, showdoc_url
-    return showdoc_url, lodview_url
-
-
-def enrich_single_sindisp(base_item: dict[str, str]) -> dict[str, str]:
-    out = dict(base_item)
-
-    atto_uri = normalize_dati_url(base_item.get("atto"))
-    lodview_url = lodview_html_url(atto_uri)
-
-    raw_lodview = ""
-    parsed_lod = {}
-
-    if lodview_url:
-        try:
-            raw_lodview = http_get(lodview_url, timeout_s=25, retries=3, backoff_s=2.0)
-            parsed_lod = parse_sindisp_lodview(raw_lodview, lodview_url)
-        except Exception as e:
-            WARNINGS.append(
-                f"LodView Sindisp non raggiungibile per {safe_str(base_item.get('numero')) or '-'}: {type(e).__name__}: {e}"
-            )
-
-    tipo = safe_str(parsed_lod.get("tipo")) or safe_str(base_item.get("tipo")) or "Sindacato ispettivo"
-    numero = safe_str(base_item.get("numero")) or safe_str(parsed_lod.get("numero"))
-    data_presentazione = safe_str(base_item.get("data_presentazione")) or safe_str(parsed_lod.get("data_presentazione"))
-
-    showdoc_url = safe_str(parsed_lod.get("showdoc_url"))
-    iniziativa_url = lodview_html_url(parsed_lod.get("iniziativa_url"))
-
-    proponente = ""
-    gruppo = ""
-    destinatario = ""
-    stato = ""
-
-    if iniziativa_url:
-        try:
-            raw_iniziativa = http_get(iniziativa_url, timeout_s=25, retries=3, backoff_s=2.0)
-            parsed_iniziativa = parse_iniziativa_lodview(raw_iniziativa)
-            proponente = safe_str(parsed_iniziativa.get("proponente"))
-            senatore_url = lodview_html_url(parsed_iniziativa.get("senatore_url"))
-
-            if senatore_url:
-                try:
-                    raw_senatore = http_get(senatore_url, timeout_s=25, retries=3, backoff_s=2.0)
-                    parsed_senatore = parse_senatore_lodview(raw_senatore)
-                    gruppo = safe_str(parsed_senatore.get("gruppo"))
-                    gruppo_url = lodview_html_url(parsed_senatore.get("gruppo_url"))
-
-                    if gruppo_url and not gruppo:
-                        try:
-                            raw_gruppo = http_get(gruppo_url, timeout_s=25, retries=3, backoff_s=2.0)
-                            parsed_gruppo = parse_gruppo_lodview(raw_gruppo)
-                            gruppo = safe_str(parsed_gruppo.get("gruppo"))
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-    if showdoc_url:
-        try:
-            raw_showdoc = http_get(showdoc_url, timeout_s=25, retries=2, backoff_s=2.0)
-            parsed_showdoc = parse_showdoc(raw_showdoc)
-            destinatario = safe_str(parsed_showdoc.get("destinatario"))
-            stato = safe_str(parsed_showdoc.get("stato"))
-            if not numero:
-                numero = safe_str(parsed_showdoc.get("numero"))
-        except Exception:
-            pass
-
-    link, link_fallback = best_public_link(showdoc_url, lodview_url)
-
-    out.update({
-        "branch": "Senato",
-        "tipo": tipo,
-        "numero": numero,
-        "data_presentazione": data_presentazione,
-        "proponente": proponente,
-        "gruppo": gruppo,
-        "destinatario": destinatario,
-        "stato": stato,
-        "url": link,
-        "url_fallback": link_fallback,
-        "showdoc_url": showdoc_url,
-        "lodview_url": lodview_url,
-    })
-
-    return out
-
-
-def dedupe_sindisp(items: list[dict[str, str]]) -> list[dict[str, str]]:
-    def score(it: dict[str, str]) -> int:
-        fields = [
-            "tipo",
-            "numero",
-            "proponente",
-            "gruppo",
-            "destinatario",
-            "stato",
-            "url",
-            "url_fallback",
-        ]
-        return sum(1 for f in fields if safe_str(it.get(f)))
-
-    best_by_key: dict[tuple[str, str], dict[str, str]] = {}
-
-    for it in items:
-        key = (
-            safe_str(it.get("tipo")).lower(),
-            safe_str(it.get("numero")).lower(),
+        SOURCES_WARNINGS.append(
+            f"Errore imprevisto durante fetch_senato_last_48h: {type(e).__name__}: {e}"
         )
-        if key not in best_by_key or score(it) > score(best_by_key[key]):
-            best_by_key[key] = it
 
-    out = list(best_by_key.values())
-    out.sort(
-        key=lambda x: (safe_str(x.get("data_presentazione")), safe_str(x.get("numero"))),
-        reverse=True,
+    acts = build_unified_acts(senato_ddls, senato_sind)
+
+    relevant_acts: list[dict[str, Any]] = []
+    non_relevant_acts: list[dict[str, Any]] = []
+
+    for act in acts:
+        title_for_classification = safe_str(act.get("titolo")) or safe_str(act.get("testo"))
+        body_for_classification = safe_str(act.get("testo"))
+
+        classification = classify_act(
+            title=title_for_classification,
+            body_text=body_for_classification,
+            kb_index=kb_index,
+        )
+        act["classification"] = classification
+
+        if classification["sector_relevant"]:
+            relevant_acts.append(act)
+        else:
+            non_relevant_acts.append(act)
+
+    body = build_email_body(
+        now_rome=now_rome,
+        relevant_acts=relevant_acts,
+        non_relevant_acts=non_relevant_acts,
     )
-    return out
+
+    msg = EmailMessage()
+    msg["Subject"] = f"Monitor Parlamento (marittimo) — {now_rome}"
+    msg["From"] = username
+    msg["To"] = to_email
+    msg.set_content(body)
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+        s.ehlo()
+        s.starttls()
+        s.login(username, password)
+        s.send_message(msg)
+
+    print("Email inviata a", to_email)
+    print("DDL:", len(senato_ddls))
+    print("Sindisp:", len(senato_sind))
+    print("Atti rilevanti:", len(relevant_acts))
+    print("Atti non rilevanti:", len(non_relevant_acts))
 
 
-def fetch_sindisp_last_days(limit_each: int, days: int) -> list[dict[str, str]]:
-    rows = query_sindisp_recent(limit_each=max(limit_each * 5, 300))
-
-    base_items: list[dict[str, str]] = []
-    for r in rows:
-        data_presentazione = safe_str(r.get("dataPresentazione"))
-        if not is_within_last_days(data_presentazione, days):
-            continue
-
-        base_items.append({
-            "atto": normalize_dati_url(safe_str(r.get("atto"))),
-            "branch": "Senato",
-            "tipo": safe_str(r.get("tipoLabel")),
-            "numero": safe_str(r.get("numero")),
-            "data_presentazione": data_presentazione,
-        })
-
-    out: list[dict[str, str]] = []
-    for it in base_items:
-        try:
-            out.append(enrich_single_sindisp(it))
-            time.sleep(0.35)
-        except Exception as e:
-            WARNINGS.append(
-                f"Enrichment Sindisp fallito per {safe_str(it.get('numero')) or '-'}: {type(e).__name__}: {e}"
-            )
-            fallback_lodview = lodview_html_url(it.get("atto"))
-            out.append({
-                "branch": "Senato",
-                "tipo": safe_str(it.get("tipo")) or "Sindacato ispettivo",
-                "numero": safe_str(it.get("numero")),
-                "data_presentazione": safe_str(it.get("data_presentazione")),
-                "proponente": "",
-                "gruppo": "",
-                "destinatario": "",
-                "stato": "",
-                "url": fallback_lodview,
-                "url_fallback": "",
-                "showdoc_url": "",
-                "lodview_url": fallback_lodview,
-            })
-
-    deduped = dedupe_sindisp(out)
-    return deduped[:limit_each]
-
-
-# =========================
-# PUBLIC API
-# =========================
-
-def fetch_senato_last_48h(limit_each: int = 200, days: int = 2) -> tuple[list[dict[str, str]], list[dict[str, str]], list[str]]:
-    WARNINGS.clear()
-
-    ddls = fetch_ddls_last_days(limit_each=limit_each, days=days)
-    sind = fetch_sindisp_last_days(limit_each=limit_each, days=days)
-
-    WARNINGS.append(f"DEBUG DDL trovati dopo filtro Python: {len(ddls)}")
-    WARNINGS.append(f"DEBUG Sindisp trovati dopo filtro Python: {len(sind)}")
-
-    return ddls, sind, list(WARNINGS)
+if __name__ == "__main__":
+    main()
