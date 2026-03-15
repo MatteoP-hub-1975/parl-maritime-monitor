@@ -2,7 +2,7 @@ name: daily-check
 
 on:
   schedule:
-    - cron: "0 7 * * *"
+    #- cron: "0 7 * * *"
   workflow_dispatch:
 
 permissions:
